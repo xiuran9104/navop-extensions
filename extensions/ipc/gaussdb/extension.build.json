@@ -1,0 +1,23 @@
+{
+  "id": "gaussdb",
+  "kind": "database_driver",
+  "language": "rust",
+  "package": "opengausscompat-driver",
+  "binary": "gaussdb-driver",
+  "manifest_path": "drivers/opengausscompat-driver/Cargo.toml",
+  "path": "extensions/ipc/gaussdb",
+  "source_paths": [
+    "drivers/opengausscompat-driver"
+  ],
+  "targets": [
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "i686-pc-windows-msvc"
+  ],
+  "releaseTagPrefix": "gaussdb-v",
+  "r2Prefix": "extensions/gaussdb",
+  "published": false
+}

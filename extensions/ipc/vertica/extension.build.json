@@ -1,0 +1,22 @@
+{
+  "id": "vertica",
+  "kind": "database_driver",
+  "language": "go",
+  "package": "./cmd/vertica-ipc-driver",
+  "binary": "vertica-ipc-driver",
+  "build_tags": [
+    "vertica_driver"
+  ],
+  "path": "extensions/ipc/vertica",
+  "targets": [
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "i686-pc-windows-msvc"
+  ],
+  "releaseTagPrefix": "vertica-v",
+  "r2Prefix": "extensions/vertica",
+  "published": false
+}

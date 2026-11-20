@@ -1,0 +1,23 @@
+{
+  "id": "h2",
+  "kind": "database_driver",
+  "language": "rust",
+  "package": "pgcompat-driver",
+  "binary": "h2-driver",
+  "manifest_path": "drivers/pgcompat-driver/Cargo.toml",
+  "path": "extensions/ipc/h2",
+  "source_paths": [
+    "drivers/pgcompat-driver"
+  ],
+  "targets": [
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "i686-pc-windows-msvc"
+  ],
+  "releaseTagPrefix": "h2-v",
+  "r2Prefix": "extensions/h2",
+  "published": false
+}

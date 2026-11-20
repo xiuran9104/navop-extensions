@@ -1,0 +1,9 @@
+name: Trino
+description: IPC driver for Trino
+"common.create": "Create"
+"database.connection.tab.general": "General"
+"database.trino.database.new": "New Database"
+"database.trino.database.name": "Database Name"
+"database.trino.database.name.placeholder": "Enter database name"
+"database.trino.catalog": "Catalog"
+"database.trino.catalog.help": ""

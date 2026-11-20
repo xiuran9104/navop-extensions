@@ -1,0 +1,7 @@
+name: StarRocks
+description: MySQL 协议兼容的 StarRocks 数据库 IPC 驱动
+"common.create": "创建"
+"database.connection.tab.general": "常规"
+"database.starrocks.database.new": "新建数据库"
+"database.starrocks.database.name": "数据库名称"
+"database.starrocks.database.name.placeholder": "输入数据库名称"

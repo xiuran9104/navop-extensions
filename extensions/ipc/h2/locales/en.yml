@@ -1,0 +1,7 @@
+name: H2
+description: PostgreSQL-wire-compatible IPC driver for H2
+"common.create": "Create"
+"database.connection.tab.general": "General"
+"database.h2.database.new": "New Database"
+"database.h2.database.name": "Database Name"
+"database.h2.database.name.placeholder": "Enter database name"

@@ -105,7 +105,10 @@ test("go ipc driver metadata excludes Java drivers", () => {
     })
     .sort();
 
-  assert.deepEqual(ids, ["dm", "iotdb", "kingbase", "oceanbase", "oracle-go"]);
+  assert.deepEqual(
+    ids,
+    ["dm", "exasol", "hana", "iotdb", "kingbase", "oceanbase", "oracle-go", "snowflake", "trino", "vertica"],
+  );
 });
 
 test("Go IPC driver manifests expose the full shared method surface", () => {
@@ -157,7 +160,12 @@ test("Go IPC driver manifests expose the full shared method surface", () => {
     "schema/dump_ddl",
   ];
 
-  for (const id of ["dm", "kingbase", "oceanbase", "oracle-go"]) {
+  for (const id of ["dm", "kingbase", "oceanbase", "oracle-go",
+    "snowflake",
+    "trino",
+    "vertica",
+    "exasol",
+    "hana"]) {
     const driverJson = JSON.parse(
       fs.readFileSync(path.join(repoRoot, "extensions/ipc", id, "driver.json"), "utf8"),
     );
@@ -175,7 +183,12 @@ test("Go IPC driver metadata declares all cross-compiled release targets", () =>
     "i686-pc-windows-msvc",
   ];
 
-  for (const id of ["dm", "iotdb", "kingbase", "oceanbase", "oracle-go"]) {
+  for (const id of ["dm", "iotdb", "kingbase", "oceanbase", "oracle-go",
+    "snowflake",
+    "trino",
+    "vertica",
+    "exasol",
+    "hana"]) {
     const metadata = JSON.parse(
       fs.readFileSync(path.join(repoRoot, "extensions/ipc", id, "extension.build.json"), "utf8"),
     );
@@ -197,7 +210,34 @@ test("native Windows extensions declare the Windows x86 release target", () => {
     "extensions/ipc/mongodb-modern",
     "extensions/ipc/mongodb-legacy-3-2",
     "extensions/ipc/opengauss",
+    "extensions/ipc/snowflake",
+    "extensions/ipc/trino",
+    "extensions/ipc/vertica",
+    "extensions/ipc/exasol",
+    "extensions/ipc/hana",
+    "extensions/ipc/cockroachdb",
+    "extensions/ipc/cloudberry",
+    "extensions/ipc/opentenbase",
+    "extensions/ipc/highgo",
+    "extensions/ipc/uxdb",
+    "extensions/ipc/gbase8c",
+    "extensions/ipc/redshift",
+    "extensions/ipc/questdb",
+    "extensions/ipc/h2",
+    "extensions/ipc/gaussdb",
+    "extensions/ipc/vastbase",
     "extensions/ipc/duckdb",
+    "extensions/ipc/mariadb",
+    "extensions/ipc/tidb",
+    "extensions/ipc/doris",
+    "extensions/ipc/starrocks",
+    "extensions/ipc/selectdb",
+    "extensions/ipc/polardb-mysql",
+    "extensions/ipc/greatsql",
+    "extensions/ipc/tdsql",
+    "extensions/ipc/goldendb",
+    "extensions/ipc/dolt",
+    "extensions/ipc/databend",
     "extensions/remote-desktop/vnc",
     "extensions/remote-desktop/rdp",
   ];
@@ -659,6 +699,106 @@ test("native Redis and MongoDB drivers keep standalone manifests and release met
       "blob/read",
       "blob/close",
     ]);
+  }
+});
+
+test("opengausscompat Rust driver packages serve GaussDB and Vastbase", () => {
+  for (const id of ["gaussdb", "vastbase"]) {
+    const metadata = JSON.parse(
+      fs.readFileSync(path.join(repoRoot, "extensions/ipc", id, "extension.build.json"), "utf8"),
+    );
+    const manifest = JSON.parse(
+      fs.readFileSync(path.join(repoRoot, "extensions/ipc", id, "driver.json"), "utf8"),
+    );
+    assert.equal(metadata.language, "rust", `${id} must be a Rust driver`);
+    assert.equal(metadata.package, "opengausscompat-driver", `${id} uses the openGauss client`);
+    assert.equal(metadata.binary, `${id}-driver`, `${id} binary drifted`);
+    assert.equal(metadata.published, false, `${id} must stay unpublished until release`);
+    assert.equal(manifest.entry.command, `./${id}-driver`, `${id} entry.command drifted`);
+    assert.equal(
+      manifest.dialect.compatible_database_type,
+      "PostgreSQL",
+      `${id} must stay PostgreSQL-compatible`,
+    );
+  }
+  const cargo = fs.readFileSync(
+    path.join(repoRoot, "drivers/opengausscompat-driver/Cargo.toml"),
+    "utf8",
+  );
+  assert.match(cargo, /tokio-opengauss/, "openGauss-lineage auth requires tokio-opengauss");
+  for (const id of ["gaussdb", "vastbase"]) {
+    assert.match(cargo, new RegExp(`name = \\"${id}-driver\\"`));
+  }
+});
+
+test("mysqlcompat Rust driver packages share one crate and declare product bins", () => {
+  const ids = ["mariadb", "tidb", "doris", "starrocks", "selectdb", "polardb-mysql", "greatsql", "tdsql", "goldendb", "dolt", "databend"];
+
+  const cargo = fs.readFileSync(path.join(repoRoot, "drivers/mysqlcompat-driver/Cargo.toml"), "utf8");
+  for (const id of ids) {
+    const metadata = JSON.parse(
+      fs.readFileSync(path.join(repoRoot, "extensions/ipc", id, "extension.build.json"), "utf8"),
+    );
+    const manifest = JSON.parse(
+      fs.readFileSync(path.join(repoRoot, "extensions/ipc", id, "driver.json"), "utf8"),
+    );
+    assert.equal(metadata.language, "rust", `${id} must be a Rust driver`);
+    assert.equal(metadata.package, "mysqlcompat-driver", `${id} must build from the shared crate`);
+    assert.equal(metadata.binary, `${id}-driver`, `${id} binary drifted`);
+    assert.equal(metadata.published, false, `${id} must stay unpublished until release`);
+    assert.equal(manifest.entry.command, `./${id}-driver`, `${id} entry.command drifted`);
+    assert.equal(
+      manifest.dialect.compatible_database_type,
+      "MySQL",
+      `${id} must stay MySQL-compatible`,
+    );
+    assert.match(
+      cargo,
+      new RegExp(`name = \\"${id}-driver\\"`),
+      `mysqlcompat-driver Cargo.toml must declare the ${id} bin`,
+    );
+  }
+});
+
+test("pgcompat Rust driver packages share one crate and declare product bins", () => {
+  const ids = [
+    "cockroachdb",
+    "cloudberry",
+    "opentenbase",
+    "highgo",
+    "uxdb",
+    "gbase8c",
+    "redshift",
+    "questdb",
+    "h2",
+  ];
+
+  const cargo = fs.readFileSync(
+    fs.readFileSync ? path.join(repoRoot, "drivers/pgcompat-driver/Cargo.toml") : "",
+    "utf8",
+  );
+  for (const id of ids) {
+    const metadata = JSON.parse(
+      fs.readFileSync(path.join(repoRoot, "extensions/ipc", id, "extension.build.json"), "utf8"),
+    );
+    const manifest = JSON.parse(
+      fs.readFileSync(path.join(repoRoot, "extensions/ipc", id, "driver.json"), "utf8"),
+    );
+    assert.equal(metadata.language, "rust", `${id} must be a Rust driver`);
+    assert.equal(metadata.package, "pgcompat-driver", `${id} must build from the shared crate`);
+    assert.equal(metadata.binary, `${id}-driver`, `${id} binary drifted`);
+    assert.equal(metadata.published, false, `${id} must stay unpublished until release`);
+    assert.equal(manifest.entry.command, `./${id}-driver`, `${id} entry.command drifted`);
+    assert.equal(
+      manifest.dialect.compatible_database_type,
+      "PostgreSQL",
+      `${id} must stay PostgreSQL-compatible`,
+    );
+    assert.match(
+      cargo,
+      new RegExp(`name = \\"${id}-driver\\"`),
+      `pgcompat-driver Cargo.toml must declare the ${id} bin`,
+    );
   }
 });
 
@@ -1871,7 +2011,10 @@ test("IPC driver categories keep domestic database routing manifest-driven", () 
     }
   }
 
-  assert.deepEqual(domesticIds, ["dm", "gbase8a", "gbase8s", "kingbase", "oceanbase", "opengauss", "oscar"]);
+  assert.deepEqual(
+    domesticIds,
+    ["cloudberry", "databend", "dm", "doris", "gaussdb", "gbase8a", "gbase8c", "gbase8s", "goldendb", "greatsql", "highgo", "kingbase", "oceanbase", "opengauss", "opentenbase", "oscar", "polardb-mysql", "selectdb", "starrocks", "tdsql", "tidb", "uxdb", "vastbase"],
+  );
 });
 
 test("IPC connection form extra params use raw extra parameter keys", () => {

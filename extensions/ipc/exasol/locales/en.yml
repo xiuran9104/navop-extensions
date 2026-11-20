@@ -1,0 +1,7 @@
+name: Exasol
+description: IPC driver for Exasol
+"common.create": "Create"
+"database.connection.tab.general": "General"
+"database.exasol.database.new": "New Database"
+"database.exasol.database.name": "Database Name"
+"database.exasol.database.name.placeholder": "Enter database name"

@@ -1,0 +1,7 @@
+name: Cloudberry
+description: PostgreSQL 协议兼容的 Cloudberry 數據庫 IPC 驅動
+"common.create": "建立"
+"database.connection.tab.general": "一般"
+"database.cloudberry.database.new": "新建資料庫"
+"database.cloudberry.database.name": "資料庫名稱"
+"database.cloudberry.database.name.placeholder": "輸入資料庫名稱"

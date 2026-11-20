@@ -1,0 +1,7 @@
+name: Databend
+description: MySQL-wire-compatible IPC driver for Databend
+"common.create": "Create"
+"database.connection.tab.general": "General"
+"database.databend.database.new": "New Database"
+"database.databend.database.name": "Database Name"
+"database.databend.database.name.placeholder": "Enter database name"

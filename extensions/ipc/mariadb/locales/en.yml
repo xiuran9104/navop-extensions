@@ -1,0 +1,7 @@
+name: MariaDB
+description: MySQL-wire-compatible IPC driver for MariaDB
+"common.create": "Create"
+"database.connection.tab.general": "General"
+"database.mariadb.database.new": "New Database"
+"database.mariadb.database.name": "Database Name"
+"database.mariadb.database.name.placeholder": "Enter database name"

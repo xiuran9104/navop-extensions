@@ -1,0 +1,7 @@
+name: Dolt
+description: MySQL-wire-compatible IPC driver for Dolt
+"common.create": "Create"
+"database.connection.tab.general": "General"
+"database.dolt.database.new": "New Database"
+"database.dolt.database.name": "Database Name"
+"database.dolt.database.name.placeholder": "Enter database name"

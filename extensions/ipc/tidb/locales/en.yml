@@ -1,0 +1,7 @@
+name: TiDB
+description: MySQL-wire-compatible IPC driver for TiDB
+"common.create": "Create"
+"database.connection.tab.general": "General"
+"database.tidb.database.new": "New Database"
+"database.tidb.database.name": "Database Name"
+"database.tidb.database.name.placeholder": "Enter database name"

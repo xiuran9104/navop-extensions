@@ -1,0 +1,7 @@
+name: GoldenDB
+description: MySQL-wire-compatible IPC driver for GoldenDB
+"common.create": "Create"
+"database.connection.tab.general": "General"
+"database.goldendb.database.new": "New Database"
+"database.goldendb.database.name": "Database Name"
+"database.goldendb.database.name.placeholder": "Enter database name"

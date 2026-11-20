@@ -1,0 +1,7 @@
+name: GaussDB
+description: PostgreSQL-wire IPC driver for GaussDB
+"common.create": "Create"
+"database.connection.tab.general": "General"
+"database.gaussdb.database.new": "New Database"
+"database.gaussdb.database.name": "Database Name"
+"database.gaussdb.database.name.placeholder": "Enter database name"

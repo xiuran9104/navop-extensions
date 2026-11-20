@@ -66,6 +66,23 @@ type SchemaSQL struct {
 	// table. Return an empty string when the dialect has no such provider so
 	// the host falls back to the shared column-based DDL builder.
 	DumpDDL func(Config, string, string, string) string
+
+	// Args-bound variants (see SchemaQuery). When set they take precedence
+	// over the matching legacy string function above, and the executor
+	// passes the values as query parameters instead of SQL text.
+	DatabasesQ      func(Config) SchemaQuery
+	SchemasQ        func(Config, string) SchemaQuery
+	ObjectsQ        func(Config, string, string, []string) SchemaQuery
+	ColumnsQ        func(Config, string, string, string) SchemaQuery
+	IndexesQ        func(Config, string, string, string) SchemaQuery
+	ForeignKeysQ    func(Config, string, string, string) SchemaQuery
+	ViewsQ          func(Config, string, string) SchemaQuery
+	FunctionsQ      func(Config, string, string) SchemaQuery
+	ProceduresQ     func(Config, string, string) SchemaQuery
+	TriggersQ       func(Config, string, string, string) SchemaQuery
+	SequencesQ      func(Config, string, string) SchemaQuery
+	ViewDefinitionQ func(Config, string, string, string) SchemaQuery
+	DumpDDLQ        func(Config, string, string, string) SchemaQuery
 }
 
 func ConfigFromWire(raw map[string]any, defaultPort int) (Config, error) {

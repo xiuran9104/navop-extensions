@@ -104,8 +104,8 @@ func scanCurrentRow(rows *sql.Rows, kinds []string) ([]cellValue, error) {
 	return row, nil
 }
 
-func queryObjects(ctx context.Context, db *sql.DB, sqlText string, mapRow func([]any) map[string]any) ([]map[string]any, error) {
-	rows, err := db.QueryContext(ctx, sqlText)
+func queryObjects(ctx context.Context, db *sql.DB, query SchemaQuery, mapRow func([]any) map[string]any) ([]map[string]any, error) {
+	rows, err := db.QueryContext(ctx, query.SQL, query.Args...)
 	if err != nil {
 		return nil, err
 	}

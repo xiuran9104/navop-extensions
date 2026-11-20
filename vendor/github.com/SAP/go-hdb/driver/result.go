@@ -1,0 +1,315 @@
+package driver
+
+import (
+	"context"
+	"database/sql/driver"
+	"errors"
+	"io"
+	"reflect"
+
+	p "github.com/SAP/go-hdb/driver/internal/protocol"
+)
+
+// check if rows types do implement all driver row interfaces.
+var (
+	// queryResult.
+	_ driver.Rows                           = (*queryResult)(nil)
+	_ driver.RowsColumnTypeDatabaseTypeName = (*queryResult)(nil)
+	_ driver.RowsColumnTypeLength           = (*queryResult)(nil)
+	_ driver.RowsColumnTypeNullable         = (*queryResult)(nil)
+	_ driver.RowsColumnTypePrecisionScale   = (*queryResult)(nil)
+	_ driver.RowsColumnTypeScanType         = (*queryResult)(nil)
+
+	// queryMultiResult.
+	_ driver.Rows                           = (*queryMultiResult)(nil)
+	_ driver.RowsColumnTypeDatabaseTypeName = (*queryMultiResult)(nil)
+	_ driver.RowsColumnTypeLength           = (*queryMultiResult)(nil)
+	_ driver.RowsColumnTypeNullable         = (*queryMultiResult)(nil)
+	_ driver.RowsColumnTypePrecisionScale   = (*queryMultiResult)(nil)
+	_ driver.RowsColumnTypeScanType         = (*queryMultiResult)(nil)
+	_ driver.RowsNextResultSet              = (*queryMultiResult)(nil)
+
+	// noResultType.
+	_ driver.Rows = (*noResultType)(nil)
+	// callResult.
+	_ driver.Rows = (*callResult)(nil)
+)
+
+type prepareResult struct {
+	fc              p.FunctionCode
+	stmtID          uint64
+	parameterFields []*p.ParameterField
+	resultFields    []*p.ResultField
+}
+
+// ParameterTypes implements the PrepareMetadata interface.
+func (pr *prepareResult) ParameterTypes() []ParameterType {
+	parameterTypes := make([]ParameterType, len(pr.parameterFields))
+	for i, f := range pr.parameterFields {
+		parameterTypes[i] = f
+	}
+	return parameterTypes
+}
+
+func (pr *prepareResult) columnTypes() []ColumnType {
+	columnTypes := make([]ColumnType, len(pr.resultFields))
+	for i, f := range pr.resultFields {
+		columnTypes[i] = f
+	}
+	return columnTypes
+}
+
+func (pr *prepareResult) procedureCallColumnTypes() []ColumnType {
+	var columnTypes []ColumnType
+	for _, f := range pr.parameterFields {
+		if f.InOut() || f.Out() {
+			columnTypes = append(columnTypes, f)
+		}
+	}
+	return columnTypes
+}
+
+// ColumnTypes implements the PrepareMetadata interface.
+func (pr *prepareResult) ColumnTypes() []ColumnType {
+	if pr.isProcedureCall() {
+		return pr.procedureCallColumnTypes()
+	}
+	return pr.columnTypes()
+}
+
+// isProcedureCall returns true if the statement is a call statement.
+func (pr *prepareResult) isProcedureCall() bool { return pr.fc.IsProcedureCall() }
+
+// numField returns the number of parameter fields in a database statement.
+func (pr *prepareResult) numField() int { return len(pr.parameterFields) }
+
+// NoResult is the driver.Rows drop-in replacement if driver Query or QueryRow is used for statements that do not return rows.
+var noResult = new(noResultType)
+
+var noColumns = []string{}
+
+type noResultType struct{}
+
+func (r *noResultType) Columns() []string              { return noColumns }
+func (r *noResultType) Close() error                   { return nil }
+func (r *noResultType) Next(dest []driver.Value) error { return io.EOF }
+
+// queryResult represents a single resultset of a query.
+type queryResult struct {
+	// field alignment
+	fields          []*p.ResultField
+	fieldValues     []driver.Value
+	decodeErrors    p.DecodeErrors
+	_columns        []string
+	lastErr         error
+	session         *session
+	rsID            uint64
+	pos             int
+	attrs           p.PartAttributes
+	tableOutTracker *tableOutTracker
+	closed          bool
+}
+
+// ErrScanOnClosedResultset is the error raised in case a scan is executed on a closed resultset.
+var ErrScanOnClosedResultset = errors.New("scan on closed resultset")
+
+// Columns implements the driver.Rows interface.
+func (qr *queryResult) Columns() []string {
+	if qr._columns != nil {
+		return qr._columns
+	}
+	qr._columns = make([]string, len(qr.fields))
+	for i, f := range qr.fields {
+		qr._columns[i] = f.Name()
+	}
+	return qr._columns
+}
+
+// Close implements the driver.Rows interface. A table resultset releases
+// itself to its tableOutTracker (if any) so the connection teardown can proceed
+// once the last table rowset is closed (see tableOutTracker.release).
+func (qr *queryResult) Close() error {
+	if qr.closed {
+		return nil
+	}
+	qr.closed = true
+	err := qr.close()
+	if qr.tableOutTracker != nil {
+		qr.tableOutTracker.release()
+	}
+	return err
+}
+
+func (qr *queryResult) close() error {
+	if qr.attrs.ResultsetClosed() {
+		return nil
+	}
+	// if lastError is set, attrs are nil
+	if qr.lastErr != nil {
+		return qr.lastErr
+	}
+	return qr.session.closeResultsetID(context.Background(), qr.rsID)
+}
+
+func (qr *queryResult) numRow() int {
+	if len(qr.fieldValues) == 0 {
+		return 0
+	}
+	return len(qr.fieldValues) / len(qr.fields)
+}
+
+// nextRow advances to the next row and returns the row index or io.EOF.
+func (qr *queryResult) nextRow() (int, error) {
+	if qr.pos >= qr.numRow() {
+		if qr.attrs.LastPacket() {
+			return -1, io.EOF
+		}
+		if err := qr.session.fetchNext(context.Background(), qr); err != nil {
+			qr.lastErr = err // fieldValues and attrs are nil
+			return -1, err
+		}
+		if qr.numRow() == 0 {
+			return -1, io.EOF
+		}
+		qr.pos = 0
+	}
+	row := qr.pos
+	qr.pos++
+	return row, nil
+}
+
+// Next implements the driver.Rows interface.
+func (qr *queryResult) Next(dest []driver.Value) error {
+	row, err := qr.nextRow()
+	if err != nil {
+		return err
+	}
+
+	// copy row.
+	cols := len(qr.fields)
+	copy(dest, qr.fieldValues[row*cols:(row+1)*cols])
+	return qr.decodeErrors.RowErrors(row)
+}
+
+// ColumnTypeDatabaseTypeName implements the driver.RowsColumnTypeDatabaseTypeName interface.
+func (qr *queryResult) ColumnTypeDatabaseTypeName(idx int) string {
+	return qr.fields[idx].DatabaseTypeName()
+}
+
+// ColumnTypeLength implements the driver.RowsColumnTypeLength interface.
+func (qr *queryResult) ColumnTypeLength(idx int) (int64, bool) { return qr.fields[idx].Length() }
+
+// ColumnTypeNullable implements the driver.RowsColumnTypeNullable interface.
+func (qr *queryResult) ColumnTypeNullable(idx int) (bool, bool) { return qr.fields[idx].Nullable() }
+
+// ColumnTypePrecisionScale implements the driver.RowsColumnTypePrecisionScale interface.
+func (qr *queryResult) ColumnTypePrecisionScale(idx int) (int64, int64, bool) {
+	return qr.fields[idx].DecimalSize()
+}
+
+// ColumnTypeScanType implements the driver.RowsColumnTypeScanType interface.
+func (qr *queryResult) ColumnTypeScanType(idx int) reflect.Type { return qr.fields[idx].ScanType() }
+
+// queryMultiResult represents multi resultsets of a query.
+type queryMultiResult struct {
+	idx int
+	qrs []*queryResult
+}
+
+// Columns implements the driver.Rows interface.
+func (qmr *queryMultiResult) Columns() []string { return qmr.qrs[qmr.idx].Columns() }
+
+// Close implements the driver.Rows interface.
+func (qmr *queryMultiResult) Close() error {
+	errs := []error{}
+	for _, qr := range qmr.qrs {
+		if err := qr.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// Next implements the driver.Rows interface.
+func (qmr *queryMultiResult) Next(dest []driver.Value) error { return qmr.qrs[qmr.idx].Next(dest) }
+
+// ColumnTypeDatabaseTypeName implements the driver.RowsColumnTypeDatabaseTypeName interface.
+func (qmr *queryMultiResult) ColumnTypeDatabaseTypeName(idx int) string {
+	return qmr.qrs[qmr.idx].ColumnTypeDatabaseTypeName(idx)
+}
+
+// ColumnTypeLength implements the driver.RowsColumnTypeLength interface.
+func (qmr *queryMultiResult) ColumnTypeLength(idx int) (int64, bool) {
+	return qmr.qrs[qmr.idx].ColumnTypeLength(idx)
+}
+
+// ColumnTypeNullable implements the driver.RowsColumnTypeNullable interface.
+func (qmr *queryMultiResult) ColumnTypeNullable(idx int) (bool, bool) {
+	return qmr.qrs[qmr.idx].ColumnTypeNullable(idx)
+}
+
+// ColumnTypePrecisionScale implements the driver.RowsColumnTypePrecisionScale interface.
+func (qmr *queryMultiResult) ColumnTypePrecisionScale(idx int) (int64, int64, bool) {
+	return qmr.qrs[qmr.idx].ColumnTypePrecisionScale(idx)
+}
+
+// ColumnTypeScanType implements the driver.RowsColumnTypeScanType interface.
+func (qmr *queryMultiResult) ColumnTypeScanType(idx int) reflect.Type {
+	return qmr.qrs[qmr.idx].ColumnTypeScanType(idx)
+}
+
+// HasNextResultSet implements the driver.RowsNextResultSet interface.
+func (qmr *queryMultiResult) HasNextResultSet() bool { return qmr.idx+1 < len(qmr.qrs) }
+
+// NextResultSet implements the driver.RowsNextResultSet interface.
+func (qmr *queryMultiResult) NextResultSet() error {
+	qmr.idx++
+	if qmr.idx >= len(qmr.qrs) {
+		return io.EOF
+	}
+	return nil
+}
+
+type callResult struct { // call output parameters
+	session      *session
+	outFields    []*p.ParameterField
+	fieldValues  []driver.Value
+	decodeErrors p.DecodeErrors
+	_columns     []string
+	eof          bool
+	closed       bool
+}
+
+// Columns implements the driver.Rows interface.
+func (cr *callResult) Columns() []string {
+	if cr._columns != nil {
+		return cr._columns
+	}
+	cr._columns = make([]string, len(cr.outFields))
+	for i, f := range cr.outFields {
+		cr._columns[i] = f.Name()
+	}
+	return cr._columns
+}
+
+// nextRow advances to the call result row. It returns io.EOF if there is no row.
+func (cr *callResult) nextRow() error {
+	if len(cr.fieldValues) == 0 || cr.eof {
+		return io.EOF
+	}
+
+	cr.eof = true
+	return nil
+}
+
+// Next implements the driver.Rows interface.
+func (cr *callResult) Next(dest []driver.Value) error {
+	if err := cr.nextRow(); err != nil {
+		return err
+	}
+	copy(dest, cr.fieldValues)
+	return cr.decodeErrors.RowErrors(0)
+}
+
+// Close implements the driver.Rows interface.
+func (cr *callResult) Close() error { cr.closed = true; return nil }

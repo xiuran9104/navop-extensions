@@ -1,0 +1,7 @@
+name: Apache Doris
+description: MySQL 协议兼容的 Apache Doris 数据库 IPC 驱动
+"common.create": "创建"
+"database.connection.tab.general": "常规"
+"database.doris.database.new": "新建数据库"
+"database.doris.database.name": "数据库名称"
+"database.doris.database.name.placeholder": "输入数据库名称"

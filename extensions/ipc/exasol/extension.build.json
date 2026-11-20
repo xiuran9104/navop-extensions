@@ -1,0 +1,22 @@
+{
+  "id": "exasol",
+  "kind": "database_driver",
+  "language": "go",
+  "package": "./cmd/exasol-ipc-driver",
+  "binary": "exasol-ipc-driver",
+  "build_tags": [
+    "exasol_driver"
+  ],
+  "path": "extensions/ipc/exasol",
+  "targets": [
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "i686-pc-windows-msvc"
+  ],
+  "releaseTagPrefix": "exasol-v",
+  "r2Prefix": "extensions/exasol",
+  "published": false
+}

@@ -1,0 +1,358 @@
+// Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package trino
+
+import (
+	"encoding/hex"
+	"encoding/json/jsontext"
+	"fmt"
+	"math"
+	"reflect"
+	"regexp"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+)
+
+type UnsupportedArgError struct {
+	t string
+}
+
+func (e UnsupportedArgError) Error() string {
+	return fmt.Sprintf("trino: unsupported arg type: %s", e.t)
+}
+
+// Numeric is a string representation of a number, such as "10", "5.5" or in scientific form
+// If another string format is used it will error to serialise
+type Numeric string
+
+// numericLiteral matches the decimal and scientific number literals Trino
+// accepts unquoted in a query. Anything else, such as NaN, Inf, hexadecimal
+// floats or digit separators, must not be inlined: Trino would read NaN or
+// Inf as a column reference and reject the rest with a syntax error.
+var numericLiteral = regexp.MustCompile(`^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$`)
+
+// trinoDate represents a Date type in Trino.
+type trinoDate struct {
+	year  int
+	month time.Month
+	day   int
+}
+
+// Date creates a representation of a Trino Date type.
+func Date(year int, month time.Month, day int) trinoDate {
+	return trinoDate{year, month, day}
+}
+
+// trinoTime represents a Time type in Trino.
+type trinoTime struct {
+	hour       int
+	minute     int
+	second     int
+	nanosecond int
+}
+
+// Time creates a representation of a Trino Time type. To represent time with precision higher than nanoseconds, pass the value as a string and use a cast in the query.
+func Time(hour int,
+	minute int,
+	second int,
+	nanosecond int) trinoTime {
+	return trinoTime{hour, minute, second, nanosecond}
+}
+
+// trinoTimeTz represents a Time(9) With Timezone type in Trino.
+type trinoTimeTz time.Time
+
+// TimeTz creates a representation of a Trino Time(9) With Timezone type.
+func TimeTz(hour int,
+	minute int,
+	second int,
+	nanosecond int,
+	location *time.Location) trinoTimeTz {
+	// When reading a time, a nil location indicates UTC.
+	// However, passing nil to time.Date() panics.
+	if location == nil {
+		location = time.UTC
+	}
+	return trinoTimeTz(time.Date(0, 0, 0, hour, minute, second, nanosecond, location))
+}
+
+// Timestamp indicates we want a TimeStamp type WITHOUT a time zone in Trino from a Golang time.
+type trinoTimestamp time.Time
+
+// Timestamp creates a representation of a Trino Timestamp(9) type.
+func Timestamp(year int,
+	month time.Month,
+	day int,
+	hour int,
+	minute int,
+	second int,
+	nanosecond int) trinoTimestamp {
+	return trinoTimestamp(time.Date(year, month, day, hour, minute, second, nanosecond, time.UTC))
+}
+
+// Serial converts any supported value to its equivalent string for as a Trino parameter
+// See https://trino.io/docs/current/language/types.html
+func Serial(v interface{}) (string, error) {
+	switch x := v.(type) {
+	case nil:
+		return "NULL", nil
+
+	// numbers convertible to int
+	case int8:
+		return strconv.Itoa(int(x)), nil
+	case int16:
+		return strconv.Itoa(int(x)), nil
+	case int32:
+		return strconv.Itoa(int(x)), nil
+	case int:
+		return strconv.Itoa(x), nil
+	case uint16:
+		return strconv.Itoa(int(x)), nil
+
+	case int64:
+		return strconv.FormatInt(x, 10), nil
+
+	case uint32:
+		return strconv.FormatUint(uint64(x), 10), nil
+	case uint:
+		return strconv.FormatUint(uint64(x), 10), nil
+	case uint64:
+		return strconv.FormatUint(x, 10), nil
+
+	case float32:
+		return serialFloat("REAL", float64(x), 32), nil
+	case float64:
+		return serialFloat("DOUBLE", x, 64), nil
+
+	case Numeric:
+		if !numericLiteral.MatchString(string(x)) {
+			return "", fmt.Errorf("trino: Numeric %q is not a decimal or scientific number literal", string(x))
+		}
+		return string(x), nil
+
+		// note byte and uint are not supported, this is because byte is an alias for uint8
+		// if you were to use uint8 (as a number) it could be interpreted as a byte, so it is unsupported
+		// use string instead of byte and any other uint/int type for uint8
+	case byte:
+		return "", UnsupportedArgError{"byte/uint8"}
+
+	case bool:
+		return strconv.FormatBool(x), nil
+
+	case string:
+		return "'" + strings.Replace(x, "'", "''", -1) + "'", nil
+
+	case []byte:
+		if x == nil {
+			return "NULL", nil
+		}
+		return "X'" + hex.EncodeToString(x) + "'", nil
+
+	case trinoDate:
+		return fmt.Sprintf("DATE '%04d-%02d-%02d'", x.year, x.month, x.day), nil
+	case trinoTime:
+		return fmt.Sprintf("TIME '%02d:%02d:%02d.%09d'", x.hour, x.minute, x.second, x.nanosecond), nil
+	case trinoTimeTz:
+		if err := checkWholeMinuteOffset(time.Time(x)); err != nil {
+			return "", err
+		}
+		// Trino only accepts a numeric offset in TIME WITH TIME ZONE literals,
+		// so UTC has to be written as +00:00 and not as Z.
+		return "TIME " + time.Time(x).Format("'15:04:05.999999999 -07:00'"), nil
+	case trinoTimestamp:
+		return "TIMESTAMP " + time.Time(x).Format("'2006-01-02 15:04:05.999999999'"), nil
+	case time.Time:
+		if err := checkWholeMinuteOffset(x); err != nil {
+			return "", err
+		}
+		return "TIMESTAMP " + x.Format("'2006-01-02 15:04:05.999999999 Z07:00'"), nil
+
+	case time.Duration:
+		return serialDuration(x)
+	case Interval:
+		return serialInterval(x)
+
+		// TODO - json.RawMesssage should probably be matched to 'JSON' in Trino
+		// json.RawMessage is an alias of jsontext.Value since Go 1.27.
+	case jsontext.Value:
+		return "", UnsupportedArgError{"json.RawMessage"}
+	}
+
+	if reflect.TypeOf(v).Kind() == reflect.Slice {
+		x := reflect.ValueOf(v)
+		if x.IsNil() {
+			return "", UnsupportedArgError{"[]<nil>"}
+		}
+
+		slice := make([]interface{}, x.Len())
+
+		for i := 0; i < x.Len(); i++ {
+			slice[i] = x.Index(i).Interface()
+		}
+
+		return serialSlice(slice)
+	}
+
+	if reflect.TypeOf(v).Kind() == reflect.Map {
+		return serialMap(reflect.ValueOf(v))
+	}
+
+	// TODO - consider the remaining types in https://trino.io/docs/current/language/types.html (Row, IP, ...)
+
+	return "", UnsupportedArgError{fmt.Sprintf("%T", v)}
+}
+
+// checkWholeMinuteOffset rejects offsets with seconds, like the local mean
+// time of zones before they adopted standard time, because Trino does not
+// accept them and dropping the seconds would send a different instant.
+func checkWholeMinuteOffset(t time.Time) error {
+	if _, offset := t.Zone(); offset%60 != 0 {
+		return fmt.Errorf("trino: cannot send %v: Trino does not support time zone offsets with seconds", t)
+	}
+	return nil
+}
+
+// serialFloat formats a typed literal using the shortest representation
+// that parses back to the same value, so no precision is lost on the way
+// to the server. Infinities are spelled the way Trino's varchar cast expects.
+func serialFloat(typeName string, value float64, bitSize int) string {
+	var literal string
+	switch {
+	case math.IsInf(value, 1):
+		literal = "Infinity"
+	case math.IsInf(value, -1):
+		literal = "-Infinity"
+	default:
+		literal = strconv.FormatFloat(value, 'g', -1, bitSize)
+	}
+	return typeName + " '" + literal + "'"
+}
+
+func serialSlice(v []interface{}) (string, error) {
+	ss := make([]string, len(v))
+
+	for i, x := range v {
+		s, err := Serial(x)
+		if err != nil {
+			return "", err
+		}
+		ss[i] = s
+	}
+
+	return "ARRAY[" + strings.Join(ss, ", ") + "]", nil
+}
+
+// serialMap sorts the entries by their key literal, so that the same map
+// always produces the same query text; Trino maps are unordered either way.
+func serialMap(m reflect.Value) (string, error) {
+	if m.Len() == 0 {
+		return "MAP()", nil
+	}
+
+	type entry struct {
+		key   string
+		value string
+	}
+	entries := make([]entry, 0, m.Len())
+	for iter := m.MapRange(); iter.Next(); {
+		key, err := Serial(iter.Key().Interface())
+		if err != nil {
+			return "", err
+		}
+		value, err := Serial(iter.Value().Interface())
+		if err != nil {
+			return "", err
+		}
+		entries = append(entries, entry{key, value})
+	}
+	slices.SortFunc(entries, func(a, b entry) int { return strings.Compare(a.key, b.key) })
+
+	keys := make([]string, len(entries))
+	values := make([]string, len(entries))
+	for i, e := range entries {
+		keys[i] = e.key
+		values[i] = e.value
+	}
+	return "MAP(ARRAY[" + strings.Join(keys, ", ") + "], ARRAY[" + strings.Join(values, ", ") + "])", nil
+}
+
+const (
+	// For seconds with milliseconds there is a maximum length of 10 digits
+	// or 11 characters with the dot and 12 characters with the minus sign and dot
+	maxIntervalStrLenWithDot = 11 // 123456789.1 and 12345678.91 are valid
+)
+
+func serialDuration(dur time.Duration) (string, error) {
+	switch {
+	case dur%time.Hour == 0:
+		return serialHoursInterval(dur), nil
+	case dur%time.Minute == 0:
+		return serialMinutesInterval(dur), nil
+	case dur%time.Second == 0:
+		return serialSecondsInterval(dur)
+	case dur%time.Millisecond == 0:
+		return serialMillisecondsInterval(dur)
+	default:
+		return serialFractionalSecondsInterval(dur, 0), nil
+	}
+}
+
+func serialHoursInterval(dur time.Duration) string {
+	return "INTERVAL '" + strconv.Itoa(int(dur/time.Hour)) + "' HOUR"
+}
+
+func serialMinutesInterval(dur time.Duration) string {
+	return "INTERVAL '" + strconv.Itoa(int(dur/time.Minute)) + "' MINUTE"
+}
+
+func serialSecondsInterval(dur time.Duration) (string, error) {
+	seconds := int64(dur / time.Second)
+	if seconds <= math.MinInt32 || seconds > math.MaxInt32 {
+		return "", fmt.Errorf("trino: duration %v is out of range for interval of seconds type", dur)
+	}
+	return "INTERVAL '" + strconv.FormatInt(seconds, 10) + "' SECOND", nil
+}
+
+func serialMillisecondsInterval(dur time.Duration) (string, error) {
+	// Format the magnitude and add the sign afterwards, so that a negative
+	// duration shorter than one second keeps its sign: int64(-500ms / 1s) is 0.
+	abs := dur.Abs()
+	seconds := int64(abs / time.Second)
+	millisInSecond := abs.Milliseconds() % 1000
+	intervalNr := strings.TrimRight(fmt.Sprintf("%d.%03d", seconds, millisInSecond), "0")
+	if len(intervalNr) > maxIntervalStrLenWithDot {
+		return "", fmt.Errorf("trino: duration %v is out of range for interval of seconds with millis type", dur)
+	}
+	if dur < 0 {
+		intervalNr = "-" + intervalNr
+	}
+	return "INTERVAL '" + intervalNr + "' SECOND", nil
+}
+
+// serialFractionalSecondsInterval declares the precision the fraction needs,
+// which only Trino 484 and later accept. An older server would truncate the
+// same literal without a precision to milliseconds, so it rejects the query
+// instead of comparing against a different value.
+func serialFractionalSecondsInterval(dur time.Duration, picoseconds int) string {
+	sign := ""
+	if dur < 0 || picoseconds < 0 {
+		sign = "-"
+	}
+	seconds := strconv.FormatInt(int64((dur / time.Second).Abs()), 10)
+	fraction := strings.TrimRight(fmt.Sprintf("%09d%03d", int64((dur%time.Second).Abs()), max(picoseconds, -picoseconds)), "0")
+	return fmt.Sprintf("INTERVAL '%s%s.%s' SECOND(%d, %d)", sign, seconds, fraction, len(seconds), len(fraction))
+}

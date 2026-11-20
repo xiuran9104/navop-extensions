@@ -1,0 +1,7 @@
+name: SelectDB
+description: MySQL-wire-compatible IPC driver for SelectDB
+"common.create": "Create"
+"database.connection.tab.general": "General"
+"database.selectdb.database.new": "New Database"
+"database.selectdb.database.name": "Database Name"
+"database.selectdb.database.name.placeholder": "Enter database name"

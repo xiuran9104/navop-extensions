@@ -1,0 +1,7 @@
+name: TDSQL for MySQL
+description: MySQL 协议兼容的 TDSQL for MySQL 數據庫 IPC 驅動
+"common.create": "建立"
+"database.connection.tab.general": "一般"
+"database.tdsql.database.new": "新建資料庫"
+"database.tdsql.database.name": "資料庫名稱"
+"database.tdsql.database.name.placeholder": "輸入資料庫名稱"

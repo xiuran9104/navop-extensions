@@ -1,0 +1,23 @@
+{
+  "id": "dolt",
+  "kind": "database_driver",
+  "language": "rust",
+  "package": "mysqlcompat-driver",
+  "binary": "dolt-driver",
+  "manifest_path": "drivers/mysqlcompat-driver/Cargo.toml",
+  "path": "extensions/ipc/dolt",
+  "source_paths": [
+    "drivers/mysqlcompat-driver"
+  ],
+  "targets": [
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "i686-pc-windows-msvc"
+  ],
+  "releaseTagPrefix": "dolt-v",
+  "r2Prefix": "extensions/dolt",
+  "published": false
+}

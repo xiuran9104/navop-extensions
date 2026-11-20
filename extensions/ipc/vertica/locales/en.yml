@@ -1,0 +1,7 @@
+name: Vertica
+description: IPC driver for Vertica
+"common.create": "Create"
+"database.connection.tab.general": "General"
+"database.vertica.database.new": "New Database"
+"database.vertica.database.name": "Database Name"
+"database.vertica.database.name.placeholder": "Enter database name"

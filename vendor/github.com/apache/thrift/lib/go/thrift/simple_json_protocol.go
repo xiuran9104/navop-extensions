@@ -30,6 +30,7 @@ import (
 	"io"
 	"math"
 	"strconv"
+	"strings"
 )
 
 type _ParseContext int
@@ -93,7 +94,6 @@ var errEmptyJSONContextStack = NewTProtocolExceptionWithType(INVALID_DATA, error
 // This protocol produces/consumes a simple output format
 // suitable for parsing by scripting languages.  It should not be
 // confused with the full-featured TJSONProtocol.
-//
 type TSimpleJSONProtocol struct {
 	trans TTransport
 
@@ -121,8 +121,7 @@ func NewTSimpleJSONProtocolConf(t TTransport, conf *TConfiguration) *TSimpleJSON
 		writer: bufio.NewWriter(t),
 		reader: bufio.NewReader(t),
 	}
-	v.parseContextStack.push(_CONTEXT_IN_TOPLEVEL)
-	v.dumpContext.push(_CONTEXT_IN_TOPLEVEL)
+	v.resetContextStack()
 	return v
 }
 
@@ -342,6 +341,10 @@ func (p *TSimpleJSONProtocol) WriteBinary(ctx context.Context, v []byte) error {
 	return p.OutputPostValue()
 }
 
+func (p *TSimpleJSONProtocol) WriteUUID(ctx context.Context, v Tuuid) error {
+	return p.OutputString(v.String())
+}
+
 // Reading methods.
 func (p *TSimpleJSONProtocol) ReadMessageBegin(ctx context.Context) (name string, typeId TMessageType, seqId int32, err error) {
 	p.resetContextStack() // THRIFT-3735
@@ -429,7 +432,13 @@ func (p *TSimpleJSONProtocol) ReadMapBegin(ctx context.Context) (keyType TType, 
 	if err != nil {
 		return keyType, valueType, 0, err
 	}
-	err = checkSizeForProtocol(int32(size), p.cfg)
+	if iSize > math.MaxInt32 {
+		return keyType, valueType, 0, NewTProtocolExceptionWithType(
+			SIZE_LIMIT,
+			fmt.Errorf("size exceeded max allowed: %d", iSize),
+		)
+	}
+	err = checkSizeForProtocol(int32(iSize), p.cfg)
 	if err != nil {
 		return keyType, valueType, 0, err
 	}
@@ -594,6 +603,16 @@ func (p *TSimpleJSONProtocol) ReadBinary(ctx context.Context) ([]byte, error) {
 	}
 
 	return v, p.ParsePostValue()
+}
+
+func (p *TSimpleJSONProtocol) ReadUUID(ctx context.Context) (v Tuuid, err error) {
+	var s string
+	s, err = p.ReadString(ctx)
+	if err != nil {
+		return v, err
+	}
+	v, err = ParseTuuid(s)
+	return v, NewTProtocolExceptionWithType(INVALID_DATA, err)
 }
 
 func (p *TSimpleJSONProtocol) Flush(ctx context.Context) (err error) {
@@ -910,15 +929,7 @@ func (p *TSimpleJSONProtocol) ParseStringBody() (string, error) {
 	if err != nil {
 		return "", NewTProtocolException(err)
 	}
-	l := len(line)
-	// count number of escapes to see if we need to keep going
-	i := 1
-	for ; i < l; i++ {
-		if line[l-i-1] != '\\' {
-			break
-		}
-	}
-	if i&0x01 == 1 {
+	if endsWithoutEscapedQuote(line) {
 		v, ok := jsonUnquote(string(JSON_QUOTE) + line)
 		if !ok {
 			return "", NewTProtocolException(err)
@@ -939,27 +950,29 @@ func (p *TSimpleJSONProtocol) ParseStringBody() (string, error) {
 }
 
 func (p *TSimpleJSONProtocol) ParseQuotedStringBody() (string, error) {
-	line, err := p.reader.ReadString(JSON_QUOTE)
-	if err != nil {
-		return "", NewTProtocolException(err)
+	var sb strings.Builder
+
+	for {
+		line, err := p.reader.ReadString(JSON_QUOTE)
+		if err != nil {
+			return "", NewTProtocolException(err)
+		}
+		sb.WriteString(line)
+		if endsWithoutEscapedQuote(line) {
+			return sb.String(), nil
+		}
 	}
-	l := len(line)
-	// count number of escapes to see if we need to keep going
+}
+
+func endsWithoutEscapedQuote(s string) bool {
+	l := len(s)
 	i := 1
 	for ; i < l; i++ {
-		if line[l-i-1] != '\\' {
+		if s[l-i-1] != '\\' {
 			break
 		}
 	}
-	if i&0x01 == 1 {
-		return line, nil
-	}
-	s, err := p.ParseQuotedStringBody()
-	if err != nil {
-		return "", NewTProtocolException(err)
-	}
-	v := line + s
-	return v, nil
+	return i&0x01 == 1
 }
 
 func (p *TSimpleJSONProtocol) ParseBase64EncodedBody() ([]byte, error) {
@@ -1104,6 +1117,12 @@ func (p *TSimpleJSONProtocol) ParseElemListBegin() (elemType TType, size int, e 
 	if err != nil {
 		return elemType, 0, err
 	}
+	if nSize > math.MaxInt32 {
+		return elemType, 0, NewTProtocolExceptionWithType(
+			SIZE_LIMIT,
+			fmt.Errorf("size exceeded max allowed: %d", nSize),
+		)
+	}
 	err = checkSizeForProtocol(int32(nSize), p.cfg)
 	if err != nil {
 		return elemType, 0, err
@@ -1188,7 +1207,7 @@ func (p *TSimpleJSONProtocol) readNumeric() (Numeric, error) {
 	for continueFor {
 		c, err := p.reader.ReadByte()
 		if err != nil {
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				break
 			}
 			return NUMERIC_NULL, NewTProtocolException(err)
@@ -1299,7 +1318,7 @@ func (p *TSimpleJSONProtocol) readNumeric() (Numeric, error) {
 
 // Safely peeks into the buffer, reading only what is necessary
 func (p *TSimpleJSONProtocol) safePeekContains(b []byte) bool {
-	for i := 0; i < len(b); i++ {
+	for i := range b {
 		a, _ := p.reader.Peek(i + 1)
 		if len(a) < (i+1) || a[i] != b[i] {
 			return false
@@ -1326,6 +1345,17 @@ func (p *TSimpleJSONProtocol) write(b []byte) (int, error) {
 func (p *TSimpleJSONProtocol) SetTConfiguration(conf *TConfiguration) {
 	PropagateTConfiguration(p.trans, conf)
 	p.cfg = conf
+}
+
+// Reset resets this protocol's internal state.
+//
+// It's useful when a single protocol instance is reused after errors, to make
+// sure the next use will not be in a bad state to begin with. An example is
+// when it's used in serializer/deserializer pools.
+func (p *TSimpleJSONProtocol) Reset() {
+	p.resetContextStack()
+	p.writer.Reset(p.trans)
+	p.reader.Reset(p.trans)
 }
 
 var (

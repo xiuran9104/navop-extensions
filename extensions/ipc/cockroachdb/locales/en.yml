@@ -1,0 +1,7 @@
+name: CockroachDB
+description: PostgreSQL-wire-compatible IPC driver for CockroachDB
+"common.create": "Create"
+"database.connection.tab.general": "General"
+"database.cockroachdb.database.new": "New Database"
+"database.cockroachdb.database.name": "Database Name"
+"database.cockroachdb.database.name.placeholder": "Enter database name"

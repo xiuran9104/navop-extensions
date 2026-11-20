@@ -1,0 +1,7 @@
+name: SAP HANA
+description: IPC driver for SAP HANA
+"common.create": "Create"
+"database.connection.tab.general": "General"
+"database.hana.database.new": "New Database"
+"database.hana.database.name": "Database Name"
+"database.hana.database.name.placeholder": "Enter database name"

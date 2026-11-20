@@ -1,0 +1,7 @@
+name: MariaDB
+description: MySQL 协议兼容的 MariaDB 数据库 IPC 驱动
+"common.create": "创建"
+"database.connection.tab.general": "常规"
+"database.mariadb.database.new": "新建数据库"
+"database.mariadb.database.name": "数据库名称"
+"database.mariadb.database.name.placeholder": "输入数据库名称"

@@ -1,0 +1,9 @@
+name: Trino
+description: Trino 分布式 SQL 查询引擎 IPC 驱动，支持连接测试、SQL 查询、对象浏览及数据传输
+"common.create": "创建"
+"database.connection.tab.general": "常规"
+"database.trino.database.new": "新建数据库"
+"database.trino.database.name": "数据库名称"
+"database.trino.database.name.placeholder": "输入数据库名称"
+"database.trino.catalog": "Catalog"
+"database.trino.catalog.help": ""

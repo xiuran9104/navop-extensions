@@ -1,0 +1,7 @@
+name: Apache Doris
+description: MySQL-wire-compatible IPC driver for Apache Doris
+"common.create": "Create"
+"database.connection.tab.general": "General"
+"database.doris.database.new": "New Database"
+"database.doris.database.name": "Database Name"
+"database.doris.database.name.placeholder": "Enter database name"

@@ -1,0 +1,7 @@
+name: Vastbase
+description: PostgreSQL-wire IPC driver for Vastbase
+"common.create": "Create"
+"database.connection.tab.general": "General"
+"database.vastbase.database.new": "New Database"
+"database.vastbase.database.name": "Database Name"
+"database.vastbase.database.name.placeholder": "Enter database name"

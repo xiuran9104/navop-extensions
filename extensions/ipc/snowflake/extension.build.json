@@ -1,0 +1,22 @@
+{
+  "id": "snowflake",
+  "kind": "database_driver",
+  "language": "go",
+  "package": "./cmd/snowflake-ipc-driver",
+  "binary": "snowflake-ipc-driver",
+  "build_tags": [
+    "snowflake_driver"
+  ],
+  "path": "extensions/ipc/snowflake",
+  "targets": [
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "i686-pc-windows-msvc"
+  ],
+  "releaseTagPrefix": "snowflake-v",
+  "r2Prefix": "extensions/snowflake",
+  "published": false
+}

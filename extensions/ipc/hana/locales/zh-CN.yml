@@ -1,0 +1,7 @@
+name: SAP HANA
+description: SAP HANA 内存数据库 IPC 驱动，支持连接测试、SQL 查询、对象浏览及数据传输
+"common.create": "创建"
+"database.connection.tab.general": "常规"
+"database.hana.database.new": "新建数据库"
+"database.hana.database.name": "数据库名称"
+"database.hana.database.name.placeholder": "输入数据库名称"

@@ -1,0 +1,7 @@
+name: GoldenDB
+description: MySQL 协议兼容的 GoldenDB 数据库 IPC 驱动
+"common.create": "创建"
+"database.connection.tab.general": "常规"
+"database.goldendb.database.new": "新建数据库"
+"database.goldendb.database.name": "数据库名称"
+"database.goldendb.database.name.placeholder": "输入数据库名称"

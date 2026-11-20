@@ -1,0 +1,7 @@
+name: PolarDB MySQL
+description: MySQL-wire-compatible IPC driver for PolarDB MySQL
+"common.create": "Create"
+"database.connection.tab.general": "General"
+"database.polardb-mysql.database.new": "New Database"
+"database.polardb-mysql.database.name": "Database Name"
+"database.polardb-mysql.database.name.placeholder": "Enter database name"

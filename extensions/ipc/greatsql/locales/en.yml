@@ -1,0 +1,7 @@
+name: GreatSQL
+description: MySQL-wire-compatible IPC driver for GreatSQL
+"common.create": "Create"
+"database.connection.tab.general": "General"
+"database.greatsql.database.new": "New Database"
+"database.greatsql.database.name": "Database Name"
+"database.greatsql.database.name.placeholder": "Enter database name"

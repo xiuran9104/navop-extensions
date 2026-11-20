@@ -1,0 +1,25 @@
+# https://golangci-lint.run/docs/configuration/file
+version: "2"
+run:
+  tests: true
+linters:
+  default: standard
+  exclusions:
+    generated: strict
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      # Exclude some linters from running on tests files.
+      - linters:
+          - dupl
+          - errcheck
+          - gocyclo
+          - gosec
+        path: _test\.go
+formatters:
+  enable:
+    - gofmt
+    - goimports

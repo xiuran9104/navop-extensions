@@ -1,0 +1,23 @@
+{
+  "id": "tdsql",
+  "kind": "database_driver",
+  "language": "rust",
+  "package": "mysqlcompat-driver",
+  "binary": "tdsql-driver",
+  "manifest_path": "drivers/mysqlcompat-driver/Cargo.toml",
+  "path": "extensions/ipc/tdsql",
+  "source_paths": [
+    "drivers/mysqlcompat-driver"
+  ],
+  "targets": [
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "i686-pc-windows-msvc"
+  ],
+  "releaseTagPrefix": "tdsql-v",
+  "r2Prefix": "extensions/tdsql",
+  "published": false
+}

@@ -1,0 +1,7 @@
+name: StarRocks
+description: MySQL-wire-compatible IPC driver for StarRocks
+"common.create": "Create"
+"database.connection.tab.general": "General"
+"database.starrocks.database.new": "New Database"
+"database.starrocks.database.name": "Database Name"
+"database.starrocks.database.name.placeholder": "Enter database name"

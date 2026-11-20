@@ -1,0 +1,7 @@
+name: TDSQL
+description: MySQL-wire-compatible IPC driver for TDSQL
+"common.create": "Create"
+"database.connection.tab.general": "General"
+"database.tdsql.database.new": "New Database"
+"database.tdsql.database.name": "Database Name"
+"database.tdsql.database.name.placeholder": "Enter database name"

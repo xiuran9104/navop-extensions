@@ -1,0 +1,7 @@
+name: OpenTenBase
+description: PostgreSQL-wire-compatible IPC driver for OpenTenBase
+"common.create": "Create"
+"database.connection.tab.general": "General"
+"database.opentenbase.database.new": "New Database"
+"database.opentenbase.database.name": "Database Name"
+"database.opentenbase.database.name.placeholder": "Enter database name"

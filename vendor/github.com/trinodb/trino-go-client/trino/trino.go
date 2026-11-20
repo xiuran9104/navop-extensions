@@ -1,0 +1,5145 @@
+// Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// This file contains code that was borrowed from prestgo, mainly some
+// data type definitions.
+//
+// See https://github.com/avct/prestgo for copyright information.
+//
+// The MIT License (MIT)
+//
+// Copyright (c) 2015 Avocet Systems Ltd.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+// Package trino provides a database/sql driver for Trino.
+//
+// The driver should be used via the database/sql package:
+//
+//	import "database/sql"
+//	import _ "github.com/trinodb/trino-go-client/trino"
+//
+//	dsn := "http://user@localhost:8080?catalog=default&schema=test"
+//	db, err := sql.Open("trino", dsn)
+package trino
+
+import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"database/sql"
+	"database/sql/driver"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
+	"errors"
+	"fmt"
+	"io"
+	"maps"
+	"math"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"reflect"
+	"slices"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"github.com/jcmturner/gokrb5/v8/client"
+	"github.com/klauspost/compress/zstd"
+	"github.com/pierrec/lz4/v4"
+)
+
+func init() {
+	sql.Register("trino", &Driver{})
+}
+
+var (
+	// DefaultQueryTimeout is the default timeout for queries executed without a context.
+	DefaultQueryTimeout = 10 * time.Hour
+
+	// DefaultCancelQueryTimeout is the timeout for the request to cancel queries in Trino.
+	DefaultCancelQueryTimeout = 30 * time.Second
+
+	// DefaultRequestRetryTimeout is how long a single HTTP request is retried
+	// when Config.RequestRetryTimeout is not set.
+	DefaultRequestRetryTimeout = 2 * time.Minute
+
+	// DefaultRequestRetryMaxAttempts is how many times a single HTTP request is
+	// sent when Config.RequestRetryMaxAttempts is not set.
+	DefaultRequestRetryMaxAttempts = 20
+
+	// ErrOperationNotSupported indicates that a database operation is not supported.
+	ErrOperationNotSupported = errors.New("trino: operation not supported")
+
+	// ErrTransactionInProgress indicates that a transaction is already open on
+	// the connection. Trino does not support nested transactions.
+	ErrTransactionInProgress = errors.New("trino: transaction already in progress")
+
+	// ErrQueryCancelled indicates that a query has been cancelled.
+	ErrQueryCancelled = errors.New("trino: query cancelled")
+
+	// ErrUnsupportedHeader indicates that the server response contains an unsupported header.
+	//
+	// Deprecated: every response header the server sends is handled, so this error is never returned.
+	ErrUnsupportedHeader = errors.New("trino: server response contains an unsupported header")
+
+	// ErrInvalidResponseType indicates that the server returned an invalid type definition.
+	ErrInvalidResponseType = errors.New("trino: server response contains an invalid type")
+
+	// ErrInvalidProgressCallbackHeader indicates that server did not get valid headers for progress callback
+	ErrInvalidProgressCallbackHeader = errors.New("trino: both " + trinoProgressCallbackParam + " and " + trinoProgressCallbackPeriodParam + " must be set when using progress callback")
+
+	// ErrForwardAuthorizationHeaderNotEnabled indicates that the accessToken named argument was used
+	// without enabling forwarding, which would otherwise send the token as part of the query text.
+	ErrForwardAuthorizationHeaderNotEnabled = errors.New("trino: " + accessTokenConfig + " named argument requires " + forwardAuthorizationHeaderConfig + " to be enabled")
+)
+
+const (
+	trinoHeaderPrefix = `X-Trino-`
+
+	preparedStatementHeader = trinoHeaderPrefix + "Prepared-Statement"
+	preparedStatementName   = "_trino_go"
+
+	trinoUserHeader            = trinoHeaderPrefix + `User`
+	trinoSourceHeader          = trinoHeaderPrefix + `Source`
+	trinoCatalogHeader         = trinoHeaderPrefix + `Catalog`
+	trinoSchemaHeader          = trinoHeaderPrefix + `Schema`
+	trinoSessionHeader         = trinoHeaderPrefix + `Session`
+	trinoSetCatalogHeader      = trinoHeaderPrefix + `Set-Catalog`
+	trinoSetSchemaHeader       = trinoHeaderPrefix + `Set-Schema`
+	trinoPathHeader            = trinoHeaderPrefix + `Path`
+	trinoSetPathHeader         = trinoHeaderPrefix + `Set-Path`
+	trinoSetSessionHeader      = trinoHeaderPrefix + `Set-Session`
+	trinoClearSessionHeader    = trinoHeaderPrefix + `Clear-Session`
+	trinoSetRoleHeader         = trinoHeaderPrefix + `Set-Role`
+	trinoRoleHeader            = trinoHeaderPrefix + `Role`
+	trinoExtraCredentialHeader = trinoHeaderPrefix + `Extra-Credential`
+
+	trinoTransactionHeader        = trinoHeaderPrefix + `Transaction-Id`
+	trinoStartedTransactionHeader = trinoHeaderPrefix + `Started-Transaction-Id`
+	trinoClearTransactionHeader   = trinoHeaderPrefix + `Clear-Transaction-Id`
+
+	// noTransactionID marks a request as coming from a transaction-aware client
+	// that has no transaction open yet. The server only allows START TRANSACTION
+	// when the transaction header is present, so it must be sent to open one.
+	noTransactionID = "NONE"
+
+	trinoErrorTransactionAlreadyAborted = "TRANSACTION_ALREADY_ABORTED"
+	trinoErrorNotInTransaction          = "NOT_IN_TRANSACTION"
+
+	trinoOriginalUserHeader           = trinoHeaderPrefix + `Original-User`
+	trinoOriginalRolesHeader          = trinoHeaderPrefix + `Original-Roles`
+	trinoSetAuthorizationUserHeader   = trinoHeaderPrefix + `Set-Authorization-User`
+	trinoResetAuthorizationUserHeader = trinoHeaderPrefix + `Reset-Authorization-User`
+	trinoSetOriginalRolesHeader       = trinoHeaderPrefix + `Set-Original-Roles`
+
+	trinoProgressCallbackParam       = trinoHeaderPrefix + `Progress-Callback`
+	trinoProgressCallbackPeriodParam = trinoHeaderPrefix + `Progress-Callback-Period`
+
+	trinoAddedPrepareHeader       = trinoHeaderPrefix + `Added-Prepare`
+	trinoDeallocatedPrepareHeader = trinoHeaderPrefix + `Deallocated-Prepare`
+	trinoTagsHeader               = trinoHeaderPrefix + `Client-Tags`
+	trinoTraceTokenHeader         = trinoHeaderPrefix + `Trace-Token`
+	trinoClientInfoHeader         = trinoHeaderPrefix + `Client-Info`
+	trinoLanguageHeader           = trinoHeaderPrefix + `Language`
+	trinoTimeZoneHeader           = trinoHeaderPrefix + `Time-Zone`
+	trinoResourceEstimateHeader   = trinoHeaderPrefix + `Resource-Estimate`
+
+	trinoQueryDataEncodingHeader  = trinoHeaderPrefix + `Query-Data-Encoding`
+	trinoClientCapabilitiesHeader = trinoHeaderPrefix + `Client-Capabilities`
+	// clientCapabilities lists what the driver can decode; the server falls
+	// back to a plainer representation for every capability left out.
+	clientCapabilities = "PARAMETRIC_DATETIME,PARAMETRIC_INTERVAL,NUMBER,VARIANT,VARIANT_BINARY,PATH,SESSION_AUTHORIZATION"
+	trinoEncoding      = "encoding"
+	trinoWarningsParam = "warnings"
+
+	trinoSpoolingWorkerCount    = `spooling_worker_count`
+	trinoMaxOutOfOrdersSegments = `max_out_of_order_segments`
+
+	authorizationHeader = "Authorization"
+	contentTypeHeader   = "Content-Type"
+	statementMediaType  = "text/plain; charset=utf-8"
+
+	kerberosEnabledConfig            = "KerberosEnabled"
+	kerberosKeytabPathConfig         = "KerberosKeytabPath"
+	kerberosPrincipalConfig          = "KerberosPrincipal"
+	kerberosRealmConfig              = "KerberosRealm"
+	kerberosConfigPathConfig         = "KerberosConfigPath"
+	kerberosRemoteServiceNameConfig  = "KerberosRemoteServiceName"
+	sslCertPathConfig                = "SSLCertPath"
+	sslCertConfig                    = "SSLCert"
+	sslClientCertPathConfig          = "SSLClientCertPath"
+	sslClientCertConfig              = "SSLClientCert"
+	sslClientKeyPathConfig           = "SSLClientKeyPath"
+	sslClientKeyConfig               = "SSLClientKey"
+	sslVerificationConfig            = "SSLVerification"
+	httpProxyConfig                  = "httpProxy"
+	socksProxyConfig                 = "socksProxy"
+	accessTokenConfig                = "accessToken"
+	explicitPrepareConfig            = "explicitPrepare"
+	validateConnectionConfig         = "validateConnection"
+	forwardAuthorizationHeaderConfig = "forwardAuthorizationHeader"
+	resourceEstimatesConfig          = "resourceEstimates"
+	naiveTimeZoneConfig              = "naiveTimeZone"
+
+	mapKeySeparator   = ":"
+	mapEntrySeparator = ";"
+	commaSeparator    = ","
+
+	defaultallowedOutOfOrder       = 10
+	defaultSpoolingDownloadWorkers = 5
+	defaulttrinoEncoding           = "json"
+	defaultSourceName              = "trino-go-client"
+	defaultKerberosServiceName     = "trino"
+	maxHeartbeatFailures           = 3
+	heartbeatRequestTimeout        = 10 * time.Second
+	defaultHeartbeatInterval       = 30 * time.Second
+)
+
+// segmentDownloadInitialDelay is the wait before the first retry of a spooled
+// segment download; each further retry waits phi times longer.
+var segmentDownloadInitialDelay = 200 * time.Millisecond
+
+// sessionStateHeaders are the request headers that USE, SET PATH, SET SESSION
+// and PREPARE change on a connection. ResetSession restores them to the values
+// the connection was opened with.
+var sessionStateHeaders = []string{trinoCatalogHeader, trinoSchemaHeader, trinoPathHeader, trinoSessionHeader, preparedStatementHeader}
+
+var responseToRequestHeaderMap = map[string]string{
+	trinoSetSchemaHeader:  trinoSchemaHeader,
+	trinoSetCatalogHeader: trinoCatalogHeader,
+	trinoSetPathHeader:    trinoPathHeader,
+}
+
+type Driver struct{}
+
+func (d *Driver) Open(name string) (driver.Conn, error) {
+	return newConn(name)
+}
+
+// OpenConnector implements driver.DriverContext, so sql.Open parses the DSN
+// once instead of for every connection.
+func (d *Driver) OpenConnector(name string) (driver.Connector, error) {
+	conf, err := ParseDSN(name)
+	if err != nil {
+		return nil, err
+	}
+	return newConnector(conf), nil
+}
+
+var (
+	_ driver.Driver        = &Driver{}
+	_ driver.DriverContext = &Driver{}
+)
+
+// Connector opens connections from a Config, including the fields a DSN
+// cannot carry. Use it with sql.OpenDB.
+//
+// When TLS or proxy settings apply, the connections share one HTTP transport,
+// so they reuse each other's sockets and TLS sessions. The first connection
+// builds it, reading the certificate files once for the Connector.
+type Connector struct {
+	conf              *Config
+	externalAuth      *externalAuthenticator
+	clientCredentials *clientCredentialsAuthenticator
+	transport         *driverTransport
+}
+
+func newConnector(conf *Config) *Connector {
+	return &Connector{
+		conf:              conf,
+		externalAuth:      newExternalAuthenticator(conf),
+		clientCredentials: newClientCredentialsAuthenticator(conf),
+		transport:         &driverTransport{},
+	}
+}
+
+var (
+	_ driver.Connector = &Connector{}
+	_ io.Closer        = &Connector{}
+)
+
+// NewConnector validates a copy of conf; later changes to conf do not affect
+// the Connector.
+func NewConnector(conf *Config) (*Connector, error) {
+	if conf == nil {
+		return nil, errors.New("trino: nil Config")
+	}
+	c := conf.clone()
+	c.applyDefaults()
+	serverURL, err := url.Parse(c.ServerURI)
+	if err != nil {
+		return nil, fmt.Errorf("trino: invalid server URL: %w", redactURLError(c.ServerURI, err))
+	}
+	if err := c.validate(serverURL); err != nil {
+		return nil, err
+	}
+	return newConnector(c), nil
+}
+
+func (c *Config) clone() *Config {
+	cloned := *c
+	cloned.SessionProperties = maps.Clone(c.SessionProperties)
+	cloned.ExtraCredentials = maps.Clone(c.ExtraCredentials)
+	cloned.Roles = maps.Clone(c.Roles)
+	cloned.ResourceEstimates = maps.Clone(c.ResourceEstimates)
+	cloned.ClientTags = slices.Clone(c.ClientTags)
+	if c.QueryTimeout != nil {
+		cloned.QueryTimeout = new(time.Duration)
+		*cloned.QueryTimeout = *c.QueryTimeout
+	}
+	if c.HeartbeatInterval != nil {
+		cloned.HeartbeatInterval = new(time.Duration)
+		*cloned.HeartbeatInterval = *c.HeartbeatInterval
+	}
+	if c.RequestRetryTimeout != nil {
+		cloned.RequestRetryTimeout = new(time.Duration)
+		*cloned.RequestRetryTimeout = *c.RequestRetryTimeout
+	}
+	if c.RequestRetryMaxAttempts != nil {
+		cloned.RequestRetryMaxAttempts = new(int)
+		*cloned.RequestRetryMaxAttempts = *c.RequestRetryMaxAttempts
+	}
+	if c.ExternalAuthenticationTimeout != nil {
+		cloned.ExternalAuthenticationTimeout = new(time.Duration)
+		*cloned.ExternalAuthenticationTimeout = *c.ExternalAuthenticationTimeout
+	}
+	return &cloned
+}
+
+// Connect checks ctx only before it starts: a Kerberos login and the reading
+// of certificate and keytab files cannot be cancelled.
+func (c *Connector) Connect(ctx context.Context) (driver.Conn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return newConnFromConfig(c.conf, c.externalAuth, c.clientCredentials, c.transport)
+}
+
+func (c *Connector) Driver() driver.Driver {
+	return &Driver{}
+}
+
+// Close closes the idle sockets of the transport the Connector's connections
+// share; sql.DB.Close calls it. A transport of Config.HTTPClient or of a
+// custom client is left open.
+func (c *Connector) Close() error {
+	c.transport.closeIdleConnections()
+	return nil
+}
+
+// Values of Config.SSLVerification, as in the JDBC driver.
+const (
+	SSLVerificationFull = "FULL" // Verify the certificate chain and the hostname (default)
+	SSLVerificationCA   = "CA"   // Verify the certificate chain only
+	SSLVerificationNone = "NONE" // Verify nothing
+)
+
+// Config is a configuration that can be encoded to a DSN string.
+type Config struct {
+	ServerURI                  string            // URI of the Trino server, e.g. http://user@localhost:8080
+	Source                     string            // Source of the connection (optional)
+	Catalog                    string            // Catalog (optional)
+	Schema                     string            // Schema (optional)
+	SessionProperties          map[string]string // Session properties (optional)
+	ExtraCredentials           map[string]string // Extra credentials (optional)
+	ClientTags                 []string          // A comma-separated list of “tag” strings, used to identify Trino resource groups (optional)
+	TraceToken                 string            // Token correlating the queries of this connection with the coordinator logs (optional)
+	ClientInfo                 string            // Free-form description of the client, visible in the web UI and to event listeners (optional)
+	Language                   string            // Language tag, e.g. en-US, used for locale-sensitive processing (optional)
+	TimeZone                   string            // Time zone id, e.g. Europe/Warsaw or +02:00, used by the server and to read values without a zone (optional, default is the local zone)
+	NaiveTimeZone              string            // Time zone id, e.g. UTC, to read values without a zone in instead of the session time zone, which the server keeps using (optional; DSN: naiveTimeZone)
+	ResourceEstimates          map[string]string // Expected resource usage of each query, e.g. EXECUTION_TIME: 10m, used to select a resource group (optional; DSN: resourceEstimates)
+	CustomClientName           string            // Custom client name (optional)
+	KerberosEnabled            bool              // KerberosEnabled (optional, default is false)
+	KerberosKeytabPath         string            // Kerberos Keytab Path (optional)
+	KerberosPrincipal          string            // Kerberos Principal used to authenticate to KDC (optional)
+	KerberosRemoteServiceName  string            // Trino coordinator Kerberos service name (optional)
+	KerberosRealm              string            // The Kerberos Realm (optional)
+	KerberosConfigPath         string            // The krb5 config path (optional)
+	SSLCertPath                string            // The SSL cert path for TLS verification (optional)
+	SSLCert                    string            // The SSL cert for TLS verification (optional)
+	SSLClientCertPath          string            // Path to a PEM client certificate for TLS client authentication (optional)
+	SSLClientCert              string            // PEM client certificate for TLS client authentication (optional)
+	SSLClientKeyPath           string            // Path to the PEM private key of the client certificate (optional)
+	SSLClientKey               string            // PEM private key of the client certificate (optional)
+	SSLVerification            string            // FULL, CA or NONE (optional, default FULL)
+	HTTPProxy                  string            // host:port of an HTTP proxy for every request, instead of the proxy environment variables (optional; DSN: httpProxy)
+	SOCKSProxy                 string            // host:port of a SOCKS5 proxy for every request, instead of the proxy environment variables (optional; DSN: socksProxy)
+	AccessToken                string            // An access token (JWT) for authentication (optional)
+	DisableExplicitPrepare     bool              // Disable the use of explicit prepared statements (optional, default is false)
+	SkipConnectionValidation   bool              // Skip the credentials check in Ping, for servers that cannot answer it (optional, default is false; DSN: validateConnection=false)
+	ForwardAuthorizationHeader bool              // Allow forwarding the `accessToken` named query parameter in the authorization header, overwriting the `AccessToken` option, if set (optional)
+	QueryTimeout               *time.Duration    // Configurable timeout for query (optional)
+	HeartbeatInterval          *time.Duration    // Interval between spooling-protocol HEAD heartbeats (optional; DSN: heartbeat_interval)
+	RequestRetryTimeout        *time.Duration    // How long a single HTTP request is retried (optional; DSN: request_retry_timeout)
+	RequestRetryMaxAttempts    *int              // How many times a single HTTP request is sent (optional; DSN: request_retry_max_attempts)
+	Roles                      map[string]string // Roles (optional)
+
+	ExternalAuthentication        bool           // Obtain a token through the server's external authentication, e.g. OAuth2, when it rejects a request (optional; DSN: externalAuthentication)
+	ExternalAuthenticationTimeout *time.Duration // Time the user has to authenticate (optional, default is 2m; DSN: externalAuthenticationTimeout)
+
+	OAuth2ClientID      string // Client ID for the OAuth2 client credentials flow, which obtains a token when the server rejects a request (optional, requires OAuth2ClientSecret; DSN: oauth2ClientId)
+	OAuth2ClientSecret  string // Client secret for the OAuth2 client credentials flow (optional; DSN: oauth2ClientSecret)
+	OAuth2TokenEndpoint string // https URL of the only token endpoint the client secret is sent to; a different one advertised by the server is rejected (optional, default is the one the server advertises; DSN: oauth2TokenEndpoint)
+	OAuth2Scope         string // Scope requested from the token endpoint instead of the one the server advertises (optional; DSN: oauth2Scope)
+
+	KerberosCredentialCachePath      string // Credential cache holding a ticket from kinit, used instead of a keytab (optional, default is KRB5CCNAME, then /tmp/krb5cc_<uid>, when no keytab is given)
+	KerberosServicePrincipalPattern  string // Coordinator service principal, with ${SERVICE} and ${HOST} replaced (optional, default is ${SERVICE}@${HOST})
+	KerberosDisableCanonicalHostname bool   // Replace ${HOST} with the URL host instead of its canonical name from DNS (optional, default is false; DSN: KerberosUseCanonicalHostname=false)
+
+	// Fields below cannot be expressed in a DSN; pass them with NewConnector.
+
+	HTTPClient      *http.Client    `dsn:"-"` // Client for every request, which never follows redirects (optional)
+	RedirectHandler RedirectHandler `dsn:"-"` // Sends the user to the external authentication URL (optional, default is OpenBrowser)
+	TokenCache      TokenCache      `dsn:"-"` // Keeps the external authentication token (optional, default is in memory, per Connector)
+	KerberosClient  *client.Client  `dsn:"-"` // Logged-in Kerberos client used instead of a keytab or credential cache, shared by all connections (optional, requires KerberosEnabled)
+}
+
+func (c *Config) applyDefaults() {
+	if c.Source == "" {
+		c.Source = defaultSourceName
+	}
+
+	if c.KerberosRemoteServiceName == "" && c.KerberosEnabled {
+		c.KerberosRemoteServiceName = defaultKerberosServiceName
+	}
+}
+
+func ParseDSN(dsn string) (*Config, error) {
+	serverURL, err := url.Parse(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("invalid DSN: %w", redactURLError(dsn, err))
+	}
+	if serverURL.Scheme == "" || serverURL.Host == "" {
+		return nil, errors.New("trino: invalid DSN, expected scheme://host[:port]")
+	}
+
+	// Since Go 1.17, a pair with an unencoded ';' is dropped from the query, so
+	// session properties and other lists would silently end up empty.
+	query, err := url.ParseQuery(serverURL.RawQuery)
+	if err != nil {
+		return nil, fmt.Errorf("trino: invalid DSN query, URL-encode the values, for example ';' as %%3B: %w", err)
+	}
+	config := &Config{}
+
+	serverURI := serverURL.Scheme + "://"
+	if serverURL.User != nil {
+		serverURI += serverURL.User.String() + "@"
+	}
+
+	serverURI += serverURL.Host
+
+	config.ServerURI = serverURI
+	config.Source = query.Get("source")
+
+	config.Catalog, config.Schema, err = parseCatalogAndSchema(serverURL.Path, query)
+	if err != nil {
+		return nil, err
+	}
+
+	if sessionProps := query.Get("session_properties"); sessionProps != "" {
+		var err error
+		config.SessionProperties, err = parseMapParameter(sessionProps, "session property", mapEntrySeparator, mapKeySeparator)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if extraCreds := query.Get("extra_credentials"); extraCreds != "" {
+		var err error
+		config.ExtraCredentials, err = parseMapParameter(extraCreds, "extra credential", mapEntrySeparator, mapKeySeparator)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if roles := query.Get("roles"); roles != "" {
+		var err error
+		config.Roles, err = parseMapParameter(roles, "role", mapEntrySeparator, mapKeySeparator)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if clientTags := query.Get("clientTags"); clientTags != "" {
+		config.ClientTags = strings.Split(clientTags, commaSeparator)
+	}
+
+	if resourceEstimates := query.Get(resourceEstimatesConfig); resourceEstimates != "" {
+		var err error
+		config.ResourceEstimates, err = parseMapParameter(resourceEstimates, "resource estimate", mapEntrySeparator, mapKeySeparator)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	config.TraceToken = query.Get("trace_token")
+	config.ClientInfo = query.Get("client_info")
+	config.Language = query.Get("language")
+	config.TimeZone = query.Get("timezone")
+	config.NaiveTimeZone = query.Get(naiveTimeZoneConfig)
+	config.CustomClientName = query.Get("custom_client")
+	config.AccessToken = query.Get(accessTokenConfig)
+
+	if explicitPrepare := query.Get(explicitPrepareConfig); explicitPrepare != "" {
+		explicitPrepareValue, err := strconv.ParseBool(explicitPrepare)
+		if err != nil {
+			return nil, fmt.Errorf("invalid boolean for %s: %q", explicitPrepareConfig, explicitPrepare)
+		}
+		config.DisableExplicitPrepare = !explicitPrepareValue
+	}
+
+	if validateConnection := query.Get(validateConnectionConfig); validateConnection != "" {
+		validateConnectionValue, err := strconv.ParseBool(validateConnection)
+		if err != nil {
+			return nil, fmt.Errorf("invalid boolean for %s: %q", validateConnectionConfig, validateConnection)
+		}
+		config.SkipConnectionValidation = !validateConnectionValue
+	}
+
+	if forwardAuth := query.Get(forwardAuthorizationHeaderConfig); forwardAuth != "" {
+		forwardAuthValue, err := strconv.ParseBool(forwardAuth)
+		if err != nil {
+			return nil, fmt.Errorf("invalid boolean for %s: %q", forwardAuthorizationHeaderConfig, forwardAuth)
+		}
+		config.ForwardAuthorizationHeader = forwardAuthValue
+	}
+
+	if queryTimeoutStr := query.Get("query_timeout"); queryTimeoutStr != "" {
+		queryTimeout, err := time.ParseDuration(queryTimeoutStr)
+		if err != nil {
+			return nil, fmt.Errorf("trino: invalid timeout for query_timeout: %q", queryTimeoutStr)
+		}
+		config.QueryTimeout = &queryTimeout
+	}
+
+	if requestRetryTimeoutStr := query.Get("request_retry_timeout"); requestRetryTimeoutStr != "" {
+		requestRetryTimeout, err := time.ParseDuration(requestRetryTimeoutStr)
+		if err != nil {
+			return nil, fmt.Errorf("trino: invalid timeout for request_retry_timeout: %q", requestRetryTimeoutStr)
+		}
+		config.RequestRetryTimeout = &requestRetryTimeout
+	}
+
+	if maxAttemptsStr := query.Get("request_retry_max_attempts"); maxAttemptsStr != "" {
+		maxAttempts, err := strconv.Atoi(maxAttemptsStr)
+		if err != nil {
+			return nil, fmt.Errorf("trino: request_retry_max_attempts must be a positive integer, got %q", maxAttemptsStr)
+		}
+		config.RequestRetryMaxAttempts = &maxAttempts
+	}
+
+	if heartbeatStr := query.Get("heartbeat_interval"); heartbeatStr != "" {
+		heartbeat, err := time.ParseDuration(heartbeatStr)
+		if err != nil {
+			return nil, fmt.Errorf("trino: invalid duration for heartbeat_interval: %q", heartbeatStr)
+		}
+		config.HeartbeatInterval = &heartbeat
+	}
+
+	if externalAuth := query.Get(externalAuthenticationConfig); externalAuth != "" {
+		enabled, err := strconv.ParseBool(externalAuth)
+		if err != nil {
+			return nil, fmt.Errorf("trino: invalid boolean for %s: %q", externalAuthenticationConfig, externalAuth)
+		}
+		config.ExternalAuthentication = enabled
+	}
+
+	if timeoutStr := query.Get(externalAuthenticationTimeoutConfig); timeoutStr != "" {
+		timeout, err := time.ParseDuration(timeoutStr)
+		if err != nil {
+			return nil, fmt.Errorf("trino: invalid duration for %s: %w", externalAuthenticationTimeoutConfig, err)
+		}
+		config.ExternalAuthenticationTimeout = &timeout
+	}
+
+	config.OAuth2ClientID = query.Get(oauth2ClientIDConfig)
+	config.OAuth2ClientSecret = query.Get(oauth2ClientSecretConfig)
+	config.OAuth2TokenEndpoint = query.Get(oauth2TokenEndpointConfig)
+	config.OAuth2Scope = query.Get(oauth2ScopeConfig)
+
+	if kerberosParam := query.Get(kerberosEnabledConfig); kerberosParam != "" {
+		enabled, err := strconv.ParseBool(kerberosParam)
+		if err != nil {
+			return nil, fmt.Errorf("invalid boolean for %s: %q", kerberosEnabledConfig, kerberosParam)
+		}
+		config.KerberosEnabled = enabled
+	}
+
+	if kp := query.Get(kerberosKeytabPathConfig); kp != "" {
+		config.KerberosKeytabPath = kp
+	}
+
+	if p := query.Get(kerberosPrincipalConfig); p != "" {
+		config.KerberosPrincipal = p
+	}
+
+	if r := query.Get(kerberosRealmConfig); r != "" {
+		config.KerberosRealm = r
+	}
+
+	if kp := query.Get(kerberosConfigPathConfig); kp != "" {
+		config.KerberosConfigPath = kp
+	}
+
+	if rsn := query.Get(kerberosRemoteServiceNameConfig); rsn != "" {
+		config.KerberosRemoteServiceName = rsn
+	}
+
+	if ccache := query.Get(kerberosCredentialCachePathConfig); ccache != "" {
+		config.KerberosCredentialCachePath = ccache
+	}
+
+	if pattern := query.Get(kerberosServicePrincipalPatternConfig); pattern != "" {
+		config.KerberosServicePrincipalPattern = pattern
+	}
+
+	if canonical := query.Get(kerberosUseCanonicalHostnameConfig); canonical != "" {
+		enabled, err := strconv.ParseBool(canonical)
+		if err != nil {
+			return nil, fmt.Errorf("trino: invalid boolean for %s: %q", kerberosUseCanonicalHostnameConfig, canonical)
+		}
+		config.KerberosDisableCanonicalHostname = !enabled
+	}
+
+	if sslCertPath := query.Get(sslCertPathConfig); sslCertPath != "" {
+		config.SSLCertPath = sslCertPath
+	}
+
+	if sslCert := query.Get(sslCertConfig); sslCert != "" {
+		config.SSLCert = sslCert
+	}
+
+	if sslClientCertPath := query.Get(sslClientCertPathConfig); sslClientCertPath != "" {
+		config.SSLClientCertPath = sslClientCertPath
+	}
+
+	if sslClientCert := query.Get(sslClientCertConfig); sslClientCert != "" {
+		config.SSLClientCert = sslClientCert
+	}
+
+	if sslClientKeyPath := query.Get(sslClientKeyPathConfig); sslClientKeyPath != "" {
+		config.SSLClientKeyPath = sslClientKeyPath
+	}
+
+	if sslClientKey := query.Get(sslClientKeyConfig); sslClientKey != "" {
+		config.SSLClientKey = sslClientKey
+	}
+
+	if sslVerification := query.Get(sslVerificationConfig); sslVerification != "" {
+		config.SSLVerification = sslVerification
+	}
+
+	config.HTTPProxy = query.Get(httpProxyConfig)
+	config.SOCKSProxy = query.Get(socksProxyConfig)
+
+	config.applyDefaults()
+	// The DSN path holds the catalog and schema, which validate would reject
+	// as a path of ServerURI.
+	serverURL.Path, serverURL.RawPath = "", ""
+	if err := config.validate(serverURL); err != nil {
+		return nil, err
+	}
+	return config, nil
+}
+
+// validate checks the settings that do not depend on DSN syntax.
+func (c *Config) validate(serverURL *url.URL) error {
+	if serverURL.Scheme == "" || serverURL.Host == "" {
+		return errors.New("trino: client configuration error, ServerURI must have a scheme and a host")
+	}
+	if err := requireTLSForPassword(serverURL); err != nil {
+		return err
+	}
+	if err := c.requireTLSForCredentials(serverURL); err != nil {
+		return err
+	}
+	// ParseDSN moves the DSN path into Catalog and Schema, so only a ServerURI
+	// set directly can carry one, and the driver would otherwise ignore it.
+	if serverURL.Path != "" && serverURL.Path != "/" {
+		return fmt.Errorf("trino: client configuration error, ServerURI must not have a path, got %q; set Config.Catalog and Config.Schema instead", serverURL.Path)
+	}
+	if err := c.validateHeaderKeys(); err != nil {
+		return err
+	}
+	isSSL := serverURL.Scheme == "https"
+	hasClientCert := c.SSLClientCert != "" || c.SSLClientCertPath != ""
+	hasClientKey := c.SSLClientKey != "" || c.SSLClientKeyPath != ""
+	if c.HTTPClient != nil && (c.CustomClientName != "" || c.SSLCert != "" || c.SSLCertPath != "" || hasClientCert || c.SSLVerification != "") {
+		return errors.New("trino: client configuration error, HTTPClient cannot be combined with a custom client, SSL certificates or SSLVerification; configure its transport with Config.TLSConfig instead")
+	}
+	if err := c.validateCustomClientTLS(); err != nil {
+		return err
+	}
+	if c.SSLCertPath != "" {
+		if !isSSL {
+			return errors.New("trino: client configuration error, SSL must be enabled to specify a custom SSL certificate file")
+		}
+		if c.SSLCert != "" {
+			return errors.New("trino: client configuration error, a custom SSL certificate file cannot be specified together with a certificate string")
+		}
+	}
+	if c.SSLCert != "" && !isSSL {
+		return errors.New("trino: client configuration error, SSL must be enabled to specify a custom SSL certificate")
+	}
+	if err := validatePEM(isSSL, "client certificate", c.SSLClientCertPath, c.SSLClientCert); err != nil {
+		return err
+	}
+	if err := validatePEM(isSSL, "client key", c.SSLClientKeyPath, c.SSLClientKey); err != nil {
+		return err
+	}
+	if hasClientCert != hasClientKey {
+		return errors.New("trino: client configuration error, a client certificate and its key must be specified together")
+	}
+	if c.SSLVerification != "" {
+		if !isSSL {
+			return fmt.Errorf("trino: client configuration error, SSL must be enabled to specify %s", sslVerificationConfig)
+		}
+		if _, err := c.sslVerificationMode(); err != nil {
+			return err
+		}
+	}
+	if err := c.validateProxy(); err != nil {
+		return err
+	}
+	if c.KerberosEnabled && !isSSL {
+		return errors.New("trino: client configuration error, SSL must be enabled for secure env")
+	}
+	if err := c.validateKerberos(); err != nil {
+		return err
+	}
+	if err := c.validateExternalAuthentication(serverURL); err != nil {
+		return err
+	}
+	if c.ExternalAuthenticationTimeout != nil && *c.ExternalAuthenticationTimeout <= 0 {
+		return fmt.Errorf("trino: %s must be positive, got %s", externalAuthenticationTimeoutConfig, *c.ExternalAuthenticationTimeout)
+	}
+	if err := c.validateClientCredentials(serverURL); err != nil {
+		return err
+	}
+	if c.HeartbeatInterval != nil && *c.HeartbeatInterval <= 0 {
+		return fmt.Errorf("trino: heartbeat_interval must be positive, got %s", *c.HeartbeatInterval)
+	}
+	if c.RequestRetryTimeout != nil && *c.RequestRetryTimeout <= 0 {
+		return fmt.Errorf("trino: request_retry_timeout must be positive, got %s", *c.RequestRetryTimeout)
+	}
+	if c.RequestRetryMaxAttempts != nil && *c.RequestRetryMaxAttempts <= 0 {
+		return fmt.Errorf("trino: request_retry_max_attempts must be a positive integer, got %d", *c.RequestRetryMaxAttempts)
+	}
+	if _, err := encodeResourceEstimates(c.ResourceEstimates); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateHeaderKeys rejects names the server would split differently than
+// intended, since entries are sent as comma-separated name=value pairs and
+// only values are URL-encoded.
+func (c *Config) validateHeaderKeys() error {
+	if err := validateMapKeys("session_properties", c.SessionProperties); err != nil {
+		return err
+	}
+	if err := validateMapKeys("extra_credentials", c.ExtraCredentials); err != nil {
+		return err
+	}
+	if err := validateMapKeys("roles", c.Roles); err != nil {
+		return err
+	}
+	for _, tag := range c.ClientTags {
+		if tag == "" {
+			return errors.New("trino: clientTags tag is empty")
+		}
+		if strings.Contains(tag, commaSeparator) {
+			return fmt.Errorf("trino: clientTags tag %q must not contain ','", tag)
+		}
+	}
+	return nil
+}
+
+// validateDSNEntries rejects entries ParseDSN would read differently. The DSN
+// joins entries with ';' and splits each at the first ':', and has no way to
+// escape either, so a ';' in a key or value or a ':' in a key would move or
+// drop the rest of the entry. A Connector has no such limit.
+func (c *Config) validateDSNEntries() error {
+	for _, parameter := range []struct {
+		name    string
+		entries map[string]string
+	}{
+		{"session_properties", c.SessionProperties},
+		{"extra_credentials", c.ExtraCredentials},
+		{"roles", c.Roles},
+		{resourceEstimatesConfig, c.ResourceEstimates},
+	} {
+		for _, key := range slices.Sorted(maps.Keys(parameter.entries)) {
+			if strings.Contains(key, mapKeySeparator) || strings.Contains(key, mapEntrySeparator) || strings.Contains(parameter.entries[key], mapEntrySeparator) {
+				return fmt.Errorf("trino: %s entry with %s cannot be expressed in a DSN, use NewConnector", parameter.name, quotedKey(parameter.name, key))
+			}
+		}
+	}
+	return nil
+}
+
+func validateMapKeys(parameter string, entries map[string]string) error {
+	for _, key := range slices.Sorted(maps.Keys(entries)) {
+		if key == "" {
+			return fmt.Errorf("trino: %s key is empty", parameter)
+		}
+		if i := strings.IndexAny(key, "=,"); i >= 0 {
+			return fmt.Errorf("trino: %s %s must not contain %q", parameter, quotedKey(parameter, key), key[i])
+		}
+		if !isASCII(key) {
+			return fmt.Errorf("trino: %s %s contains spaces or is not printable ASCII", parameter, quotedKey(parameter, key))
+		}
+	}
+	return nil
+}
+
+// validateCustomClientTLS rejects TLS settings a custom client would ignore,
+// since its own transport decides how to verify the coordinator.
+func (c *Config) validateCustomClientTLS() error {
+	if c.CustomClientName == "" {
+		return nil
+	}
+	hasClientCert := c.SSLClientCert != "" || c.SSLClientCertPath != "" || c.SSLClientKey != "" || c.SSLClientKeyPath != ""
+	if c.SSLCert == "" && c.SSLCertPath == "" && !hasClientCert && c.SSLVerification == "" {
+		return nil
+	}
+	return fmt.Errorf("trino: client configuration error, %s, %s, client certificates and %s cannot be combined with a custom client; configure TLS on its transport instead", sslCertConfig, sslCertPathConfig, sslVerificationConfig)
+}
+
+// validateProxy mirrors the JDBC driver, where httpProxy and socksProxy are
+// mutually exclusive. A proxy is rejected rather than ignored with a client
+// of the caller's, so requests cannot silently bypass it.
+func (c *Config) validateProxy() error {
+	if c.HTTPProxy == "" && c.SOCKSProxy == "" {
+		return nil
+	}
+	if c.HTTPProxy != "" && c.SOCKSProxy != "" {
+		return fmt.Errorf("trino: client configuration error, %s cannot be used when %s is set", socksProxyConfig, httpProxyConfig)
+	}
+	if c.HTTPClient != nil || c.CustomClientName != "" {
+		return fmt.Errorf("trino: client configuration error, %s and %s cannot be combined with HTTPClient or a custom client; configure the proxy on its transport instead", httpProxyConfig, socksProxyConfig)
+	}
+	if err := validateProxyAddress(httpProxyConfig, c.HTTPProxy); err != nil {
+		return err
+	}
+	return validateProxyAddress(socksProxyConfig, c.SOCKSProxy)
+}
+
+func validateProxyAddress(param, address string) error {
+	if address == "" {
+		return nil
+	}
+	// The address is quoted below, and user info would hold the proxy's
+	// password.
+	if strings.Contains(address, "@") {
+		return fmt.Errorf("trino: %s must be host:port, without a user name or password", param)
+	}
+	host, port, err := net.SplitHostPort(address)
+	if err == nil && host != "" {
+		if _, err = strconv.ParseUint(port, 10, 16); err == nil {
+			return nil
+		}
+	}
+	return fmt.Errorf("trino: %s must be host:port, got %q", param, address)
+}
+
+// redactURLError keeps the password and the access token of a DSN out of a
+// url.Error, whose URL and inner message both quote parts of input: a '#', '/'
+// or '?' in a password ends the host early, and the rest of the password is
+// reported as an invalid port. Without user info, the part of input before
+// the query string holds no secrets, so the error for it is kept.
+func redactURLError(input string, err error) error {
+	var uerr *url.Error
+	if !errors.As(err, &uerr) {
+		return err
+	}
+	if strings.Contains(input, "@") {
+		return fmt.Errorf("%s: malformed URL; percent-encode reserved characters in the user name and password", uerr.Op)
+	}
+	beforeQuery, _, hasQuery := strings.Cut(input, "?")
+	if !hasQuery {
+		return err
+	}
+	if _, err := url.Parse(beforeQuery); err != nil {
+		return err
+	}
+	return fmt.Errorf("%s: malformed query string", uerr.Op)
+}
+
+// quotedKey names a map key in an error. An extra_credentials entry written
+// with the wrong separator puts credential text into the key, so those keys
+// are not quoted.
+func quotedKey(parameter, key string) string {
+	if parameter == "extra_credentials" {
+		return "key"
+	}
+	return fmt.Sprintf("key %q", key)
+}
+
+func requireTLSForPassword(serverURL *url.URL) error {
+	if serverURL.User == nil {
+		return nil
+	}
+	if pass, _ := serverURL.User.Password(); pass != "" && serverURL.Scheme != "https" {
+		return fmt.Errorf("trino: TLS/SSL is required for authentication with username and password")
+	}
+	return nil
+}
+
+// requireTLSForCredentials refuses bearer tokens over a server URL that is not
+// https: an access token and forwarded per-statement tokens can be replayed
+// like the password requireTLSForPassword covers.
+func (c *Config) requireTLSForCredentials(serverURL *url.URL) error {
+	if serverURL.Scheme == "https" {
+		return nil
+	}
+	if c.AccessToken != "" {
+		return errors.New("trino: TLS/SSL is required for authentication with an access token")
+	}
+	if c.ForwardAuthorizationHeader {
+		return errors.New("trino: TLS/SSL is required to forward access tokens with " + forwardAuthorizationHeaderConfig)
+	}
+	// Extra credentials are allowed over http, as in the JDBC driver, so a
+	// cluster without authentication can still pass them to connectors.
+	return nil
+}
+
+// parseCatalogAndSchema reads the catalog and schema from the DSN path, as
+// /catalog or /catalog/schema like in a JDBC URL, or from the catalog and
+// schema parameters. Like JDBC, it rejects setting either one both ways.
+func parseCatalogAndSchema(path string, query url.Values) (string, string, error) {
+	catalog, schema, err := parsePathCatalogAndSchema(path)
+	if err != nil {
+		return "", "", err
+	}
+	if catalog != "" && query.Has("catalog") {
+		return "", "", errors.New("trino: catalog is set both in the DSN path and the catalog parameter")
+	}
+	if schema != "" && query.Has("schema") {
+		return "", "", errors.New("trino: schema is set both in the DSN path and the schema parameter")
+	}
+	if catalog == "" {
+		catalog = query.Get("catalog")
+	}
+	if schema == "" {
+		schema = query.Get("schema")
+	}
+	return catalog, schema, nil
+}
+
+// parsePathCatalogAndSchema mirrors TrinoUri.parseCatalogAndSchema of the
+// Java client: an empty path or a lone slash sets nothing, and one trailing
+// slash is ignored.
+func parsePathCatalogAndSchema(path string) (string, string, error) {
+	if path == "" || path == "/" {
+		return "", "", nil
+	}
+	parts := strings.Split(strings.TrimPrefix(path, "/"), "/")
+	if parts[len(parts)-1] == "" {
+		parts = parts[:len(parts)-1]
+	}
+	if len(parts) > 2 {
+		return "", "", fmt.Errorf("trino: invalid path segments in DSN, expected /catalog or /catalog/schema: %q", path)
+	}
+	if parts[0] == "" {
+		return "", "", fmt.Errorf("trino: catalog name is empty in DSN path %q", path)
+	}
+	if len(parts) == 1 {
+		return parts[0], "", nil
+	}
+	if parts[1] == "" {
+		return "", "", fmt.Errorf("trino: schema name is empty in DSN path %q", path)
+	}
+	return parts[0], parts[1], nil
+}
+
+func parseMapParameter(value, paramName, entrySeparator, keyValueSeparator string) (map[string]string, error) {
+	result := make(map[string]string)
+	for i, entry := range strings.Split(value, entrySeparator) {
+		parts := strings.SplitN(entry, keyValueSeparator, 2)
+		if len(parts) != 2 {
+			// The entry may hold a credential, so it is not quoted.
+			return nil, fmt.Errorf("invalid %s entry %d: missing %q separator", paramName, i+1, keyValueSeparator)
+		}
+		result[parts[0]] = parts[1]
+	}
+	return result, nil
+}
+
+func (c *Config) FormatDSN() (string, error) {
+	if c.HTTPClient != nil {
+		return "", errors.New("trino: HTTPClient cannot be expressed in a DSN, use NewConnector")
+	}
+	if c.RedirectHandler != nil {
+		return "", errors.New("trino: RedirectHandler cannot be expressed in a DSN, use NewConnector")
+	}
+	if c.TokenCache != nil {
+		return "", errors.New("trino: TokenCache cannot be expressed in a DSN, use NewConnector")
+	}
+	if c.KerberosClient != nil {
+		return "", errors.New("trino: KerberosClient cannot be expressed in a DSN, use NewConnector")
+	}
+	c.applyDefaults()
+
+	serverURL, err := url.Parse(c.ServerURI)
+	if err != nil {
+		return "", err
+	}
+	var sessionkv []string
+	if c.SessionProperties != nil {
+		for k, v := range c.SessionProperties {
+			sessionkv = append(sessionkv, k+mapKeySeparator+v)
+		}
+	}
+	var credkv []string
+	if c.ExtraCredentials != nil {
+		for k, v := range c.ExtraCredentials {
+			credkv = append(credkv, k+mapKeySeparator+v)
+		}
+	}
+
+	var roles []string
+	if c.Roles != nil {
+		for k, v := range c.Roles {
+			roles = append(roles, fmt.Sprintf("%s:%s", k, v))
+		}
+	}
+
+	var resourceEstimates []string
+	for k, v := range c.ResourceEstimates {
+		resourceEstimates = append(resourceEstimates, k+mapKeySeparator+v)
+	}
+
+	query := make(url.Values)
+	query.Add("source", c.Source)
+
+	if c.ForwardAuthorizationHeader {
+		query.Add(forwardAuthorizationHeaderConfig, "true")
+	}
+
+	if c.ExternalAuthentication {
+		query.Add(externalAuthenticationConfig, "true")
+	}
+	if c.ExternalAuthenticationTimeout != nil {
+		query.Add(externalAuthenticationTimeoutConfig, c.ExternalAuthenticationTimeout.String())
+	}
+	if c.OAuth2ClientID != "" {
+		query.Add(oauth2ClientIDConfig, c.OAuth2ClientID)
+		query.Add(oauth2ClientSecretConfig, c.OAuth2ClientSecret)
+	}
+	if c.OAuth2TokenEndpoint != "" {
+		query.Add(oauth2TokenEndpointConfig, c.OAuth2TokenEndpoint)
+	}
+	if c.OAuth2Scope != "" {
+		query.Add(oauth2ScopeConfig, c.OAuth2Scope)
+	}
+
+	if c.DisableExplicitPrepare {
+		query.Add(explicitPrepareConfig, "false")
+	}
+
+	if c.SkipConnectionValidation {
+		query.Add(validateConnectionConfig, "false")
+	}
+
+	if err := c.validate(serverURL); err != nil {
+		return "", err
+	}
+	if err := c.validateDSNEntries(); err != nil {
+		return "", err
+	}
+	if c.SSLCertPath != "" {
+		query.Add(sslCertPathConfig, c.SSLCertPath)
+	}
+	if c.SSLCert != "" {
+		query.Add(sslCertConfig, c.SSLCert)
+	}
+
+	addPEMParam(query, sslClientCertPathConfig, c.SSLClientCertPath, sslClientCertConfig, c.SSLClientCert)
+	addPEMParam(query, sslClientKeyPathConfig, c.SSLClientKeyPath, sslClientKeyConfig, c.SSLClientKey)
+	if c.SSLVerification != "" {
+		query.Add(sslVerificationConfig, c.SSLVerification)
+	}
+	if c.HTTPProxy != "" {
+		query.Add(httpProxyConfig, c.HTTPProxy)
+	}
+	if c.SOCKSProxy != "" {
+		query.Add(socksProxyConfig, c.SOCKSProxy)
+	}
+
+	if c.KerberosEnabled {
+		query.Add(kerberosEnabledConfig, "true")
+		query.Add(kerberosKeytabPathConfig, c.KerberosKeytabPath)
+		query.Add(kerberosPrincipalConfig, c.KerberosPrincipal)
+		query.Add(kerberosRealmConfig, c.KerberosRealm)
+		query.Add(kerberosConfigPathConfig, c.KerberosConfigPath)
+		query.Add(kerberosRemoteServiceNameConfig, c.KerberosRemoteServiceName)
+		if c.KerberosCredentialCachePath != "" {
+			query.Add(kerberosCredentialCachePathConfig, c.KerberosCredentialCachePath)
+		}
+		if c.KerberosServicePrincipalPattern != "" {
+			query.Add(kerberosServicePrincipalPatternConfig, c.KerberosServicePrincipalPattern)
+		}
+		if c.KerberosDisableCanonicalHostname {
+			query.Add(kerberosUseCanonicalHostnameConfig, "false")
+		}
+	}
+
+	// ensure consistent order of items
+	sort.Strings(sessionkv)
+	sort.Strings(credkv)
+	sort.Strings(roles)
+	sort.Strings(resourceEstimates)
+
+	if c.QueryTimeout != nil {
+		query.Add("query_timeout", c.QueryTimeout.String())
+	}
+
+	if c.RequestRetryTimeout != nil {
+		query.Add("request_retry_timeout", c.RequestRetryTimeout.String())
+	}
+
+	if c.RequestRetryMaxAttempts != nil {
+		query.Add("request_retry_max_attempts", strconv.Itoa(*c.RequestRetryMaxAttempts))
+	}
+
+	if c.HeartbeatInterval != nil {
+		query.Add("heartbeat_interval", c.HeartbeatInterval.String())
+	}
+
+	if len(resourceEstimates) > 0 {
+		query.Add(resourceEstimatesConfig, strings.Join(resourceEstimates, mapEntrySeparator))
+	}
+
+	for k, v := range map[string]string{
+		"catalog":            c.Catalog,
+		"clientTags":         strings.Join(c.ClientTags, commaSeparator),
+		"trace_token":        c.TraceToken,
+		"client_info":        c.ClientInfo,
+		"language":           c.Language,
+		"timezone":           c.TimeZone,
+		naiveTimeZoneConfig:  c.NaiveTimeZone,
+		"schema":             c.Schema,
+		"session_properties": strings.Join(sessionkv, mapEntrySeparator),
+		"extra_credentials":  strings.Join(credkv, mapEntrySeparator),
+		"custom_client":      c.CustomClientName,
+		accessTokenConfig:    c.AccessToken,
+		"roles":              strings.Join(roles, mapEntrySeparator),
+	} {
+		if v != "" {
+			query[k] = []string{v}
+		}
+	}
+	serverURL.RawQuery = query.Encode()
+	return serverURL.String(), nil
+}
+
+// validatePEM checks that at most one of a PEM path or value is set, and only
+// over TLS.
+func validatePEM(isSSL bool, label, path, value string) error {
+	if path == "" && value == "" {
+		return nil
+	}
+	if !isSSL {
+		return fmt.Errorf("trino: client configuration error, SSL must be enabled to specify a %s", label)
+	}
+	if path != "" && value != "" {
+		return fmt.Errorf("trino: client configuration error, a %s file cannot be specified together with a %s string", label, label)
+	}
+	return nil
+}
+
+// addPEMParam adds whichever of a PEM path or value is set.
+func addPEMParam(query url.Values, pathParam, path, valueParam, value string) {
+	if path != "" {
+		query.Add(pathParam, path)
+	} else if value != "" {
+		query.Add(valueParam, value)
+	}
+}
+
+func (c *Config) sslVerificationMode() (string, error) {
+	switch mode := c.SSLVerification; mode {
+	case "":
+		return SSLVerificationFull, nil
+	case SSLVerificationFull, SSLVerificationCA, SSLVerificationNone:
+		return mode, nil
+	default:
+		return "", fmt.Errorf("trino: invalid SSL verification mode: %q", mode)
+	}
+}
+
+// clientCertificate returns ok false when no client certificate is set.
+func (c *Config) clientCertificate() (cert tls.Certificate, ok bool, err error) {
+	if c.SSLClientCert != "" && c.SSLClientCertPath != "" {
+		return tls.Certificate{}, false, fmt.Errorf("trino: client configuration error, a client certificate file cannot be specified together with a certificate string")
+	}
+	if c.SSLClientKey != "" && c.SSLClientKeyPath != "" {
+		return tls.Certificate{}, false, fmt.Errorf("trino: client configuration error, a client key file cannot be specified together with a key string")
+	}
+
+	certPEM := []byte(c.SSLClientCert)
+	if c.SSLClientCertPath != "" {
+		if certPEM, err = os.ReadFile(c.SSLClientCertPath); err != nil {
+			return tls.Certificate{}, false, fmt.Errorf("trino: Error loading SSL Client Cert File: %w", err)
+		}
+	}
+	keyPEM := []byte(c.SSLClientKey)
+	if c.SSLClientKeyPath != "" {
+		if keyPEM, err = os.ReadFile(c.SSLClientKeyPath); err != nil {
+			return tls.Certificate{}, false, fmt.Errorf("trino: Error loading SSL Client Key File: %w", err)
+		}
+	}
+
+	switch hasCert, hasKey := len(certPEM) != 0, len(keyPEM) != 0; {
+	case !hasCert && !hasKey:
+		return tls.Certificate{}, false, nil
+	case hasCert != hasKey:
+		return tls.Certificate{}, false, fmt.Errorf("trino: client configuration error, SSLClientCert(Path) and SSLClientKey(Path) must be specified together")
+	}
+
+	cert, err = tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		return tls.Certificate{}, false, fmt.Errorf("trino: Error loading SSL client key pair: %w", err)
+	}
+	return cert, true, nil
+}
+
+// verifyCertificateChain verifies the chain against roots, or the system
+// roots when nil, without checking the hostname.
+func verifyCertificateChain(roots *x509.CertPool) func(tls.ConnectionState) error {
+	return func(cs tls.ConnectionState) error {
+		certs := cs.PeerCertificates
+		if len(certs) == 0 {
+			return fmt.Errorf("trino: no peer certificate presented")
+		}
+		intermediates := x509.NewCertPool()
+		for _, cert := range certs[1:] {
+			intermediates.AddCert(cert)
+		}
+		_, err := certs[0].Verify(x509.VerifyOptions{Roots: roots, Intermediates: intermediates})
+		return err
+	}
+}
+
+// TLSConfig returns the TLS settings of c for an http.Client of your own, or
+// nil when Go's defaults apply.
+func (c *Config) TLSConfig() (*tls.Config, error) {
+	mode, err := c.sslVerificationMode()
+	if err != nil {
+		return nil, err
+	}
+
+	cert := []byte(c.SSLCert)
+	if certPath := c.SSLCertPath; certPath != "" {
+		if cert, err = os.ReadFile(certPath); err != nil {
+			return nil, fmt.Errorf("trino: Error loading SSL Cert File: %w", err)
+		}
+	}
+
+	clientCert, hasClientCert, err := c.clientCertificate()
+	if err != nil {
+		return nil, err
+	}
+
+	if len(cert) == 0 && !hasClientCert && mode == SSLVerificationFull {
+		return nil, nil
+	}
+
+	conf := &tls.Config{}
+	if len(cert) != 0 {
+		certPool := x509.NewCertPool()
+		certPool.AppendCertsFromPEM(cert)
+		conf.RootCAs = certPool
+	}
+	if hasClientCert {
+		conf.Certificates = []tls.Certificate{clientCert}
+	}
+	switch mode {
+	case SSLVerificationCA:
+		conf.InsecureSkipVerify = true
+		conf.VerifyConnection = verifyCertificateChain(conf.RootCAs)
+	case SSLVerificationNone:
+		conf.InsecureSkipVerify = true
+	}
+	return conf, nil
+}
+
+// Conn is a Trino connection.
+//
+// A Conn holds no socket, since every request goes through the HTTP client, so
+// the only state that can break it for good is its Kerberos client. Once that
+// client fails to build a SPNEGO token, for example because the ticket in a
+// credential cache expired and the client has no keytab or password to log in
+// again, IsValid reports false and the pool replaces the connection with one
+// that reloads the keytab or credential cache. Transactions, authorization
+// and session state are cleared by ResetSession, and external authentication
+// tokens belong to the Connector, so neither makes a connection invalid.
+type Conn struct {
+	baseURL string
+	// ownedTransport is the transport the driver created for this
+	// connection alone, which is closed with it, unlike one a Connector
+	// shares or the application supplies.
+	ownedTransport *driverTransport
+	auth           *url.Userinfo
+	httpClient     http.Client
+	// segmentHTTPClient follows redirects, which the coordinator issues for
+	// segment downloads in the COORDINATOR_STORAGE_REDIRECT and WORKER_PROXY
+	// retrieval modes. Segment requests carry only the headers the server
+	// listed for the segment, never the session headers or the credentials
+	// the driver adds; a credential-adding transport still sees them.
+	segmentHTTPClient http.Client
+	// httpHeadersMu guards httpHeaders, which the spooling heartbeat reads
+	// while the query polling updates it from the server responses, and
+	// unusable, which the spooling heartbeat can set
+	httpHeadersMu              sync.RWMutex
+	httpHeaders                http.Header
+	unusable                   bool
+	extraCredentials           []string
+	resourceEstimates          map[string]string
+	kerberosEnabled            bool
+	kerberosClient             *client.Client
+	ownsKerberosClient         bool
+	kerberosServicePrincipal   kerberosServicePrincipal
+	useExplicitPrepare         bool
+	validateConnection         bool
+	forwardAuthorizationHeader bool
+	queryTimeout               *time.Duration
+	heartbeatInterval          *time.Duration
+	// configuredUser is the X-Trino-User value from the DSN.
+	configuredUser string
+	// configuredRoles is the X-Trino-Role value from Config.Roles.
+	configuredRoles string
+	// authorizationUser is the user set by SET SESSION AUTHORIZATION, or
+	// empty when none is active. X-Trino-Original-User cannot tell, since it
+	// is empty when the DSN has no user.
+	authorizationUser string
+	// preAuthorizationRoles is the X-Trino-Role value to restore on reset.
+	preAuthorizationRoles string
+	// configuredSession holds the sessionStateHeaders values from the DSN.
+	configuredSession http.Header
+	retryLimit        retryLimit
+	// timeZone is sent as X-Trino-Time-Zone; sessionTimeZone is set when the
+	// server reports a SET TIME ZONE and takes precedence while it lasts;
+	// naiveTimeZone, when set, replaces both to read values without a zone
+	timeZone          *time.Location
+	sessionTimeZone   *time.Location
+	naiveTimeZone     *time.Location
+	externalAuth      *externalAuthenticator
+	clientCredentials *clientCredentialsAuthenticator
+}
+
+var (
+	_ driver.Conn               = &Conn{}
+	_ driver.ConnPrepareContext = &Conn{}
+	_ driver.ConnBeginTx        = &Conn{}
+	_ driver.SessionResetter    = &Conn{}
+	_ driver.Pinger             = &Conn{}
+	_ driver.Validator          = &Conn{}
+)
+
+// formatRolesFromMap formats roles from a map into the Trino header format
+func namedStringArg(arg driver.NamedValue) (string, error) {
+	value, ok := arg.Value.(string)
+	if !ok {
+		return "", fmt.Errorf("trino: %s must be a string, got %T", arg.Name, arg.Value)
+	}
+	return value, nil
+}
+
+func namedIntArg(arg driver.NamedValue) (int, error) {
+	value, err := namedStringArg(arg)
+	if err != nil {
+		return 0, err
+	}
+	number, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, fmt.Errorf("trino: %s must be an integer, got %q", arg.Name, value)
+	}
+	return number, nil
+}
+
+func formatRolesFromMap(rolesMap map[string]string) string {
+	var formattedRoles []string
+	for catalog, role := range rolesMap {
+		formattedRoles = append(formattedRoles, formatRoleEntry(catalog, role))
+	}
+	sort.Strings(formattedRoles)
+	return strings.Join(formattedRoles, commaSeparator)
+}
+
+// formatRoleEntry formats a single catalog role entry into Trino header format.
+// The whole selected role is URL-encoded, like the Java client does, so a role
+// name containing , = or } cannot add or alter entries when the server splits
+// the header.
+func formatRoleEntry(catalog, role string) string {
+	if role == "ALL" || role == "NONE" {
+		return fmt.Sprintf("%s=%s", catalog, role)
+	}
+	return catalog + "=" + url.QueryEscape("ROLE{"+role+"}")
+}
+
+// formatHeaderValue converts a named argument value to a string suitable for HTTP headers.
+func formatHeaderValue(headerName string, value interface{}) (string, error) {
+	if headerName == trinoRoleHeader {
+		rolesMap, ok := value.(map[string]string)
+		if !ok {
+			return "", fmt.Errorf("%s must be a map[string]string, got %T", trinoRoleHeader, value)
+		}
+		if err := validateMapKeys(trinoRoleHeader, rolesMap); err != nil {
+			return "", err
+		}
+		return formatRolesFromMap(rolesMap), nil
+	}
+
+	headerValue, ok := value.(string)
+	if !ok {
+		return "", fmt.Errorf("%s must be a string, got %T", headerName, value)
+	}
+	return headerValue, nil
+}
+
+func newConn(dsn string) (*Conn, error) {
+	conf, err := ParseDSN(dsn)
+	if err != nil {
+		return nil, err
+	}
+	// Without a Connector, nothing else shares or closes the transport.
+	transport := &driverTransport{}
+	c, err := newConnFromConfig(conf, newExternalAuthenticator(conf), newClientCredentialsAuthenticator(conf), transport)
+	if err != nil {
+		return nil, err
+	}
+	c.ownedTransport = transport
+	return c, nil
+}
+
+func newConnFromConfig(conf *Config, externalAuth *externalAuthenticator, clientCredentials *clientCredentialsAuthenticator, transport *driverTransport) (*Conn, error) {
+	serverURL, err := url.Parse(conf.ServerURI)
+	if err != nil {
+		return nil, fmt.Errorf("trino: invalid server URL: %w", redactURLError(conf.ServerURI, err))
+	}
+	var httpClient = http.DefaultClient
+	if conf.HTTPClient != nil {
+		httpClient = conf.HTTPClient
+	} else if clientKey := conf.CustomClientName; clientKey != "" {
+		httpClient = getCustomClient(clientKey)
+		if httpClient == nil {
+			return nil, fmt.Errorf("trino: custom client not registered: %q", clientKey)
+		}
+	} else {
+		configured, err := transport.get(conf, serverURL)
+		if err != nil {
+			return nil, err
+		}
+		if configured != nil {
+			httpClient = &http.Client{Transport: configured}
+		}
+	}
+	// Segment downloads follow redirects to the storage holding them and carry
+	// only the headers the server lists; every other request carries the
+	// connection's credentials and must stay on the configured server.
+	segmentHTTPClient := httpClient
+	httpClient = withoutRedirects(httpClient)
+
+	timeZoneName := conf.TimeZone
+	if timeZoneName == "" {
+		timeZoneName = localTimeZoneName()
+	}
+	timeZone, err := resolveTimeZone(timeZoneName)
+	if err != nil {
+		return nil, err
+	}
+	var naiveTimeZone *time.Location
+	if conf.NaiveTimeZone != "" {
+		naiveTimeZone, err = resolveTimeZone(conf.NaiveTimeZone)
+		if err != nil {
+			return nil, fmt.Errorf("%w (set by %s)", err, naiveTimeZoneConfig)
+		}
+	}
+
+	c := &Conn{
+		baseURL:                    serverURL.Scheme + "://" + serverURL.Host,
+		httpClient:                 *httpClient,
+		segmentHTTPClient:          *segmentHTTPClient,
+		httpHeaders:                make(http.Header),
+		kerberosEnabled:            conf.KerberosEnabled,
+		kerberosServicePrincipal:   newKerberosServicePrincipal(conf),
+		useExplicitPrepare:         !conf.DisableExplicitPrepare,
+		validateConnection:         !conf.SkipConnectionValidation,
+		forwardAuthorizationHeader: conf.ForwardAuthorizationHeader,
+		queryTimeout:               conf.QueryTimeout,
+		heartbeatInterval:          conf.HeartbeatInterval,
+		retryLimit:                 retryLimit{timeout: DefaultRequestRetryTimeout, maxAttempts: DefaultRequestRetryMaxAttempts},
+		timeZone:                   timeZone,
+		naiveTimeZone:              naiveTimeZone,
+		externalAuth:               externalAuth,
+		clientCredentials:          clientCredentials,
+		resourceEstimates:          maps.Clone(conf.ResourceEstimates),
+	}
+
+	if conf.RequestRetryTimeout != nil {
+		c.retryLimit.timeout = *conf.RequestRetryTimeout
+	}
+	if conf.RequestRetryMaxAttempts != nil {
+		c.retryLimit.maxAttempts = *conf.RequestRetryMaxAttempts
+	}
+
+	var user string
+	if serverURL.User != nil {
+		user = serverURL.User.Username()
+		pass, _ := serverURL.User.Password()
+		if pass != "" && serverURL.Scheme == "https" {
+			c.auth = serverURL.User
+		}
+	}
+	c.configuredUser = user
+
+	if tags := conf.ClientTags; tags != nil {
+		c.httpHeaders.Add(trinoTagsHeader, strings.Join(tags, commaSeparator))
+	}
+
+	if conf.Roles != nil {
+		rolesHeader := formatRolesFromMap(conf.Roles)
+		if rolesHeader != "" {
+			c.httpHeaders.Add(trinoRoleHeader, rolesHeader)
+			c.configuredRoles = rolesHeader
+		}
+	}
+
+	for k, v := range map[string]string{
+		trinoUserHeader:       user,
+		trinoSourceHeader:     conf.Source,
+		trinoCatalogHeader:    conf.Catalog,
+		trinoSchemaHeader:     conf.Schema,
+		trinoTraceTokenHeader: conf.TraceToken,
+		trinoClientInfoHeader: conf.ClientInfo,
+		trinoLanguageHeader:   conf.Language,
+		trinoTimeZoneHeader:   timeZoneName,
+		authorizationHeader:   getAuthorization(conf.AccessToken),
+	} {
+		if v != "" {
+			c.httpHeaders.Add(k, v)
+		}
+	}
+
+	if conf.ExtraCredentials != nil {
+		c.extraCredentials, err = decodeMapHeader("extra_credentials", conf.ExtraCredentials)
+		if err != nil {
+			return c, err
+		}
+	}
+
+	if conf.SessionProperties != nil {
+		c.httpHeaders[trinoSessionHeader], err = decodeMapHeader("session_properties", conf.SessionProperties)
+		if err != nil {
+			return c, err
+		}
+	}
+
+	c.configuredSession = http.Header{}
+	for _, name := range sessionStateHeaders {
+		if v := c.httpHeaders.Values(name); v != nil {
+			c.configuredSession[name] = slices.Clone(v)
+		}
+	}
+
+	// Log in last: a client the driver logs in renews its ticket in a
+	// goroutine until Close destroys it, so no error may follow the login.
+	if conf.KerberosEnabled {
+		c.kerberosClient, err = newKerberosClient(conf)
+		if err != nil {
+			return nil, err
+		}
+		c.ownsKerberosClient = conf.KerberosClient == nil
+	}
+
+	return c, nil
+}
+
+func decodeMapHeader(name string, m map[string]string) ([]string, error) {
+	result := make([]string, 0, len(m))
+	for key, value := range m {
+		if len(value) == 0 {
+			return nil, fmt.Errorf("trino: %s value is empty", name)
+		}
+		if !isASCII(value) {
+			return nil, fmt.Errorf("trino: %s value for key '%s' contains spaces or is not printable ASCII", name, key)
+		}
+		result = append(result, key+"="+url.QueryEscape(value))
+	}
+	return result, nil
+}
+
+// encodeResourceEstimates returns one header value per estimate, as the Java
+// client sends them. The server splits the header on ',' and each value on
+// '=', and decodes only the estimate, so a name cannot contain either.
+func encodeResourceEstimates(estimates map[string]string) ([]string, error) {
+	if err := validateMapKeys(resourceEstimatesConfig, estimates); err != nil {
+		return nil, err
+	}
+	values, err := decodeMapHeader(resourceEstimatesConfig, estimates)
+	if err != nil {
+		return nil, err
+	}
+	slices.Sort(values)
+	return values, nil
+}
+
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < '\u0021' || s[i] > '\u007E' {
+			return false
+		}
+	}
+	return true
+}
+
+func getAuthorization(token string) string {
+	if token == "" {
+		return ""
+	}
+	return fmt.Sprintf("Bearer %s", token)
+}
+
+// registry for custom http clients
+var customClientRegistry = struct {
+	sync.RWMutex
+	Index map[string]http.Client
+}{
+	Index: make(map[string]http.Client),
+}
+
+// RegisterCustomClient associates a client to a key in the driver's registry.
+//
+// Register your custom client in the driver, then refer to it by name in the DSN, on the call to sql.Open:
+//
+//	foobarClient := &http.Client{
+//		Transport: &http.Transport{
+//			Proxy: http.ProxyFromEnvironment,
+//			DialContext: (&net.Dialer{
+//				Timeout:   30 * time.Second,
+//				KeepAlive: 30 * time.Second,
+//				DualStack: true,
+//			}).DialContext,
+//			MaxIdleConns:          100,
+//			IdleConnTimeout:       90 * time.Second,
+//			TLSHandshakeTimeout:   10 * time.Second,
+//			ExpectContinueTimeout: 1 * time.Second,
+//			TLSClientConfig:       &tls.Config{
+//			// your config here...
+//			},
+//		},
+//	}
+//	trino.RegisterCustomClient("foobar", foobarClient)
+//	db, err := sql.Open("trino", "https://user@localhost:8080?custom_client=foobar")
+func RegisterCustomClient(key string, client *http.Client) error {
+	if _, err := strconv.ParseBool(key); err == nil {
+		return fmt.Errorf("trino: custom client key %q is reserved", key)
+	}
+	customClientRegistry.Lock()
+	customClientRegistry.Index[key] = *client
+	customClientRegistry.Unlock()
+	return nil
+}
+
+// DeregisterCustomClient removes the client associated to the key.
+func DeregisterCustomClient(key string) {
+	customClientRegistry.Lock()
+	delete(customClientRegistry.Index, key)
+	customClientRegistry.Unlock()
+}
+
+func getCustomClient(key string) *http.Client {
+	customClientRegistry.RLock()
+	defer customClientRegistry.RUnlock()
+	if client, ok := customClientRegistry.Index[key]; ok {
+		return &client
+	}
+	return nil
+}
+
+// Begin implements the driver.Conn interface.
+func (c *Conn) Begin() (driver.Tx, error) {
+	return c.BeginTx(context.Background(), driver.TxOptions{})
+}
+
+// BeginTx implements the driver.ConnBeginTx interface.
+//
+// Trino tracks transactions with the X-Trino-Transaction-Id header rather than
+// with connection state, and rejects START TRANSACTION unless that header is
+// present, so the header is sent as NONE to open the transaction. The ID the
+// server allocates is picked up in applyResponseHeaders and replayed on every
+// subsequent request made on this connection.
+func (c *Conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
+	if c.transactionID() != "" {
+		return nil, ErrTransactionInProgress
+	}
+	query, err := startTransactionQuery(opts)
+	if err != nil {
+		return nil, err
+	}
+	c.setHTTPHeader(trinoTransactionHeader, noTransactionID)
+	if err := c.execInternal(ctx, query); err != nil {
+		c.deleteHTTPHeader(trinoTransactionHeader)
+		return nil, err
+	}
+	if c.transactionID() == "" {
+		c.deleteHTTPHeader(trinoTransactionHeader)
+		return nil, fmt.Errorf("trino: server did not return a %s header", trinoStartedTransactionHeader)
+	}
+	return &driverTx{conn: c, ctx: context.WithoutCancel(ctx)}, nil
+}
+
+// ResetSession implements the driver.SessionResetter interface. It drops
+// the transaction, authorization user and roles of the previous caller, and
+// restores the catalog, schema, path, session properties, prepared statements
+// and time zone to the values the connection was opened with. State that
+// should carry across statements needs a pinned *sql.Conn.
+func (c *Conn) ResetSession(ctx context.Context) error {
+	c.httpHeadersMu.Lock()
+	defer c.httpHeadersMu.Unlock()
+	if c.unusable {
+		return driver.ErrBadConn
+	}
+	c.httpHeaders.Del(trinoTransactionHeader)
+	c.resetAuthorization()
+	c.setConfiguredRolesHeader()
+	for _, name := range sessionStateHeaders {
+		if v, ok := c.configuredSession[name]; ok {
+			c.httpHeaders[name] = slices.Clone(v)
+		} else {
+			c.httpHeaders.Del(name)
+		}
+	}
+	c.sessionTimeZone = nil
+	return nil
+}
+
+// IsValid implements the driver.Validator interface. It does no network I/O;
+// Ping checks the server and the credentials.
+func (c *Conn) IsValid() bool {
+	c.httpHeadersMu.RLock()
+	defer c.httpHeadersMu.RUnlock()
+	return !c.unusable
+}
+
+func (c *Conn) markUnusable() {
+	c.httpHeadersMu.Lock()
+	defer c.httpHeadersMu.Unlock()
+	c.unusable = true
+}
+
+// unsentRequestError makes database/sql retry on another connection a
+// request that failed before it was sent because this connection is no
+// longer usable. A request the server may have seen must not be retried.
+func (c *Conn) unsentRequestError(err error) error {
+	if c.IsValid() {
+		return err
+	}
+	return fmt.Errorf("%w: %w", driver.ErrBadConn, err)
+}
+
+// transactionID returns the ID of the transaction open on this connection, or
+// an empty string when the connection is in autocommit mode.
+func (c *Conn) transactionID() string {
+	if id := c.httpHeaderValue(trinoTransactionHeader); id != noTransactionID {
+		return id
+	}
+	return ""
+}
+
+// execInternal runs a statement that returns no rows, on behalf of the driver
+// rather than the caller.
+func (c *Conn) execInternal(ctx context.Context, query string) error {
+	st := &driverStmt{conn: c, query: query}
+	defer st.Close()
+	_, err := st.ExecContext(ctx, nil)
+	return err
+}
+
+func startTransactionQuery(opts driver.TxOptions) (string, error) {
+	var modes []string
+	if sql.IsolationLevel(opts.Isolation) != sql.LevelDefault {
+		level, err := isolationLevelName(sql.IsolationLevel(opts.Isolation))
+		if err != nil {
+			return "", err
+		}
+		modes = append(modes, "ISOLATION LEVEL "+level)
+	}
+	if opts.ReadOnly {
+		modes = append(modes, "READ ONLY")
+	}
+	if len(modes) == 0 {
+		return "START TRANSACTION", nil
+	}
+	return "START TRANSACTION " + strings.Join(modes, ", "), nil
+}
+
+func isolationLevelName(level sql.IsolationLevel) (string, error) {
+	switch level {
+	case sql.LevelReadUncommitted:
+		return "READ UNCOMMITTED", nil
+	case sql.LevelReadCommitted:
+		return "READ COMMITTED", nil
+	case sql.LevelRepeatableRead:
+		return "REPEATABLE READ", nil
+	case sql.LevelSerializable:
+		return "SERIALIZABLE", nil
+	}
+	return "", fmt.Errorf("trino: unsupported transaction isolation level %q", level)
+}
+
+type driverTx struct {
+	conn *Conn
+	// ctx carries the values of the BeginTx context to COMMIT and ROLLBACK,
+	// but not its cancellation: database/sql rolls back when that context is
+	// cancelled, and the ROLLBACK must still reach the server.
+	ctx context.Context
+}
+
+var _ driver.Tx = &driverTx{}
+
+// Commit implements the driver.Tx interface.
+func (tx *driverTx) Commit() error {
+	return tx.finish(tx.ctx, "COMMIT")
+}
+
+// Rollback implements the driver.Tx interface.
+func (tx *driverTx) Rollback() error {
+	// database/sql rolls back when the BeginTx context ends, and that
+	// context does not reach the ROLLBACK. Bound it like a query
+	// cancellation, so a stalled server cannot keep the connection busy
+	// for DefaultQueryTimeout after the caller gave up.
+	ctx, cancel := context.WithTimeout(tx.ctx, DefaultCancelQueryTimeout)
+	defer cancel()
+	err := tx.finish(ctx, "ROLLBACK")
+	// Trino aborts a transaction itself as soon as a statement inside it fails,
+	// and then refuses ROLLBACK for sessions carrying catalog-scoped state such
+	// as roles. The transaction is discarded either way, which is all the caller
+	// asked for, so this is not an error to report.
+	if isTrinoErrorName(err, trinoErrorTransactionAlreadyAborted, trinoErrorNotInTransaction) {
+		return nil
+	}
+	return err
+}
+
+func (tx *driverTx) finish(ctx context.Context, query string) error {
+	if tx.conn == nil {
+		return sql.ErrTxDone
+	}
+	conn := tx.conn
+	tx.conn = nil
+	// Whether or not the statement succeeds the transaction is over for this
+	// connection, and keeping a dead ID around would fail every later query.
+	defer conn.deleteHTTPHeader(trinoTransactionHeader)
+	return conn.execInternal(ctx, query)
+}
+
+// isTrinoErrorName reports whether err is an error raised by the server with one
+// of the given Trino error names.
+func isTrinoErrorName(err error, names ...string) bool {
+	var trinoErr *ErrTrino
+	if !errors.As(err, &trinoErr) {
+		return false
+	}
+	for _, name := range names {
+		if trinoErr.ErrorName == name {
+			return true
+		}
+	}
+	return false
+}
+
+// Prepare implements the driver.Conn interface.
+func (c *Conn) Prepare(query string) (driver.Stmt, error) {
+	return nil, driver.ErrSkip
+}
+
+// PrepareContext implements the driver.ConnPrepareContext interface.
+func (c *Conn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
+	return &driverStmt{conn: c, query: query}, nil
+}
+
+// Close implements the driver.Conn interface.
+func (c *Conn) Close() error {
+	if c.ownedTransport != nil {
+		c.ownedTransport.closeIdleConnections()
+	}
+	// A Config.KerberosClient belongs to the caller, who may share it.
+	if c.ownsKerberosClient {
+		c.kerberosClient.Destroy()
+	}
+	return nil
+}
+
+// rewindRequestBody restores a request body consumed by a failed attempt so
+// that a retry sends it again. net/http can rewind the in-memory bodies that
+// http.NewRequest recognizes; a body it cannot rewind makes the request
+// unretryable, which surfaces as an error instead of a retry with no body.
+func rewindRequestBody(req *http.Request) error {
+	if req.Body == nil || req.Body == http.NoBody {
+		return nil
+	}
+	if req.GetBody == nil {
+		return errors.New("trino: request body cannot be rewound for a retry")
+	}
+	body, err := req.GetBody()
+	if err != nil {
+		return fmt.Errorf("trino: rewinding request body for a retry: %w", err)
+	}
+	req.Body = body
+	return nil
+}
+
+// retryPolicy reports whether a network error, where no response arrived, is
+// retried.
+type retryPolicy func(err error) bool
+
+// dialPhaseOnly retries only errors establishing the connection, since the
+// server never saw the request. It is used for the statement POST, which is
+// not idempotent.
+func dialPhaseOnly(err error) bool {
+	var opErr *net.OpError
+	return errors.As(err, &opErr) && opErr.Op == "dial"
+}
+
+// transientNetworkError retries every transient network error. It is used for
+// idempotent requests.
+func transientNetworkError(err error) bool {
+	if dialPhaseOnly(err) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	return errors.Is(err, syscall.ECONNRESET) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
+}
+
+// retryableStatus reports whether a response status is retried. It applies to
+// the statement POST too, which the Java client also retries on 502, 503 and
+// 504. A 429 means the request was refused before it was processed (RFC 6585),
+// so retrying it cannot submit the statement twice.
+func retryableStatus(status int) bool {
+	switch status {
+	case http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	}
+	return false
+}
+
+// retryAfter returns how long a 429 or 503 response asks the client to wait
+// in its Retry-After header, given as delta-seconds or an HTTP-date (RFC 9110,
+// section 10.2.3). It reports false when the header is missing or malformed,
+// so the caller falls back to its own backoff. A date in the past means the
+// request can be retried right away.
+func retryAfter(resp *http.Response, now time.Time) (time.Duration, bool) {
+	if resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode != http.StatusServiceUnavailable {
+		return 0, false
+	}
+	value := strings.TrimSpace(resp.Header.Get("Retry-After"))
+	if value == "" {
+		return 0, false
+	}
+	if seconds, err := strconv.ParseInt(value, 10, 64); err == nil {
+		if seconds < 0 {
+			return 0, false
+		}
+		if seconds > int64(math.MaxInt64/time.Second) {
+			return time.Duration(math.MaxInt64), true
+		}
+		return time.Duration(seconds) * time.Second, true
+	}
+	date, err := http.ParseTime(value)
+	if err != nil {
+		return 0, false
+	}
+	return max(date.Sub(now), 0), true
+}
+
+func (c *Conn) newRequest(ctx context.Context, method, url string, body io.Reader, hs http.Header) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, method, url, body)
+	if err != nil {
+		return nil, fmt.Errorf("trino: %w", err)
+	}
+	// The URLs of the requests that follow a statement come from the server.
+	// Another host or port is followed, since gateways and proxies that
+	// rewrite the Host header rely on it, but a coordinator behind a proxy
+	// that terminates TLS can return http URLs, and the credentials must not
+	// be sent over them in cleartext.
+	if strings.HasPrefix(c.baseURL, "https://") && req.URL.Scheme != "https" {
+		return nil, fmt.Errorf("trino: refusing to send a request to %s, which does not use https like the server %s; "+
+			"a coordinator behind a proxy that terminates TLS needs http-server.process-forwarded=true", req.URL.Redacted(), c.baseURL)
+	}
+	req.Header.Set(userAgentHeader, userAgent)
+
+	if c.kerberosEnabled {
+		if err := c.setSPNEGOHeader(req); err != nil {
+			return nil, err
+		}
+	}
+
+	c.copyHTTPHeaders(req.Header)
+	if c.externalAuth != nil {
+		if token := c.externalAuth.cache.Token(); token != "" {
+			req.Header.Set(authorizationHeader, getAuthorization(token))
+		}
+	}
+	if c.clientCredentials != nil {
+		if token := c.clientCredentials.cachedToken(); token != "" {
+			req.Header.Set(authorizationHeader, getAuthorization(token))
+		}
+	}
+	for k, v := range hs {
+		req.Header[k] = v
+	}
+
+	// A per-statement Authorization header, such as a forwarded access
+	// token, takes precedence over the connection's credentials.
+	if c.auth != nil && hs.Get(authorizationHeader) == "" {
+		pass, _ := c.auth.Password()
+		req.SetBasicAuth(c.auth.Username(), pass)
+	}
+	return req, nil
+}
+
+// driverTransport holds the transport the driver builds when TLS or proxy
+// settings apply, so connections can share it. It is built on first use, so
+// errors reading the certificate files surface when a connection opens.
+type driverTransport struct {
+	mu        sync.Mutex
+	transport *http.Transport
+}
+
+// get returns nil when http.DefaultTransport applies.
+func (t *driverTransport) get(conf *Config, serverURL *url.URL) (*http.Transport, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.transport != nil {
+		return t.transport, nil
+	}
+	transport, err := conf.transport(serverURL)
+	if err != nil {
+		return nil, err
+	}
+	t.transport = transport
+	return transport, nil
+}
+
+func (t *driverTransport) closeIdleConnections() {
+	t.mu.Lock()
+	transport := t.transport
+	t.mu.Unlock()
+	if transport == nil {
+		return
+	}
+	transport.CloseIdleConnections()
+}
+
+// transport returns nil when http.DefaultTransport applies, which takes the
+// proxy from the HTTP_PROXY, HTTPS_PROXY and NO_PROXY environment variables.
+func (c *Config) transport(serverURL *url.URL) (*http.Transport, error) {
+	var tlsConfig *tls.Config
+	if serverURL.Scheme == "https" {
+		var err error
+		if tlsConfig, err = c.TLSConfig(); err != nil {
+			return nil, err
+		}
+	}
+	proxyURL := c.proxyURL()
+	if tlsConfig == nil && proxyURL == nil {
+		return nil, nil
+	}
+	transport := newDefaultTransport()
+	transport.TLSClientConfig = tlsConfig
+	if proxyURL != nil {
+		transport.Proxy = http.ProxyURL(proxyURL)
+	}
+	return transport, nil
+}
+
+// proxyURL returns nil when no proxy is configured. The SOCKS5 proxy resolves
+// the coordinator's host name, as the JDBC driver's unresolved proxy address
+// does.
+func (c *Config) proxyURL() *url.URL {
+	switch {
+	case c.HTTPProxy != "":
+		return &url.URL{Scheme: "http", Host: c.HTTPProxy}
+	case c.SOCKSProxy != "":
+		return &url.URL{Scheme: "socks5", Host: c.SOCKSProxy}
+	}
+	return nil
+}
+
+// newDefaultTransport copies http.DefaultTransport, so a transport the driver
+// configures keeps its proxy from the environment, timeouts and HTTP/2.
+func newDefaultTransport() *http.Transport {
+	return http.DefaultTransport.(*http.Transport).Clone()
+}
+
+// withoutRedirects returns a copy of client that hands redirects back to the
+// caller instead of following them. A redirect would carry the X-Trino-*
+// headers, including extra credentials, to a host the user did not name, and
+// a 301, 302 or 303 would turn the statement POST into a GET without its body.
+func withoutRedirects(client *http.Client) *http.Client {
+	copied := *client
+	copied.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	return &copied
+}
+
+// roundTrip sends req, retrying 429/502/503/504 responses and network errors
+// within c.retryLimit. Only idempotent requests are retried on
+// network errors; connection errors are always retried.
+func (c *Conn) roundTrip(ctx context.Context, req *http.Request) (*http.Response, error) {
+	policy := transientNetworkError
+	if req.Method == http.MethodPost {
+		policy = dialPhaseOnly
+	}
+	reauthenticated := false
+	reuses := 0
+	for {
+		resp, err := roundTrip(ctx, &c.httpClient, req, c.retryLimit, 100*time.Millisecond, policy)
+		if err != nil {
+			return nil, err
+		}
+		switch resp.StatusCode {
+		case http.StatusOK:
+			c.applyResponseHeaders(resp.Header)
+			return resp, nil
+		case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+			resp.Body.Close()
+			return nil, &ErrQueryFailed{
+				StatusCode: resp.StatusCode,
+				Reason:     fmt.Errorf("redirect to %s not followed", resp.Header.Get("Location")),
+			}
+		case http.StatusUnauthorized:
+			if c.clientCredentials != nil && !reauthenticated {
+				if err := c.authenticateWithClientCredentials(ctx, req, resp); err != nil {
+					return nil, err
+				}
+				reauthenticated = true
+				continue
+			}
+			if c.externalAuth == nil || reauthenticated {
+				return nil, newErrQueryFailedFromResponse(resp)
+			}
+			challenge, err := parseExternalAuthChallenge(resp.Header)
+			if challenge == nil && err == nil {
+				return nil, newErrQueryFailedFromResponse(resp)
+			}
+			resp.Body.Close()
+			if err != nil {
+				return nil, &ErrQueryFailed{StatusCode: resp.StatusCode, Reason: err}
+			}
+			rejected := strings.TrimPrefix(req.Header.Get(authorizationHeader), "Bearer ")
+			token, loggedIn, err := c.externalAuth.authenticate(ctx, &c.httpClient, challenge, rejected, reuses < maxCachedTokenReuses)
+			if err != nil {
+				return nil, &ErrQueryFailed{StatusCode: resp.StatusCode, Reason: err}
+			}
+			if err := rewindRequestBody(req); err != nil {
+				return nil, &ErrQueryFailed{Reason: err}
+			}
+			req.Header.Set(authorizationHeader, getAuthorization(token))
+			// A token another connection cached may be rejected too, so
+			// only a login of our own spends the one retry, and a cache
+			// that keeps offering rejected tokens is bypassed.
+			if loggedIn {
+				reauthenticated = true
+			} else {
+				reuses++
+			}
+		default:
+			return nil, newErrQueryFailedFromResponse(resp)
+		}
+	}
+}
+
+// authenticateWithClientCredentials sets a new token on req, which the
+// coordinator rejected with resp, and rewinds its body to send it again.
+func (c *Conn) authenticateWithClientCredentials(ctx context.Context, req *http.Request, resp *http.Response) error {
+	resp.Body.Close()
+	rejected := strings.TrimPrefix(req.Header.Get(authorizationHeader), "Bearer ")
+	token, err := c.clientCredentials.authenticate(ctx, &c.httpClient, parseClientCredentialsChallenge(resp.Header), rejected)
+	if err != nil {
+		return &ErrQueryFailed{StatusCode: resp.StatusCode, Reason: err}
+	}
+	if err := rewindRequestBody(req); err != nil {
+		return &ErrQueryFailed{Reason: err}
+	}
+	req.Header.Set(authorizationHeader, getAuthorization(token))
+	return nil
+}
+
+// retryLimit ends retrying at whichever limit is reached first.
+type retryLimit struct {
+	timeout     time.Duration
+	maxAttempts int
+}
+
+// roundTrip retries a 429, 502, 503 or 504 response and a network error
+// accepted by policy, backing off from initialDelay, until limit is reached.
+// A Retry-After header on a 429 or 503 response replaces the backoff for that
+// wait, which is cut short when the remaining budget is smaller.
+func roundTrip(ctx context.Context, client *http.Client, req *http.Request, limit retryLimit, initialDelay time.Duration, policy retryPolicy) (*http.Response, error) {
+	start := time.Now()
+	delay := initialDelay
+	const maxDelayBetweenRequests = float64(15 * time.Second)
+	attempt := 0
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-timer.C:
+			attempt++
+			wait := delay
+			resp, err := client.Do(req)
+			if err != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return nil, ctxErr
+				}
+				if !policy(err) {
+					return nil, &ErrQueryFailed{Reason: err}
+				}
+			} else if !retryableStatus(resp.StatusCode) {
+				return resp, nil
+			} else {
+				resp.Body.Close()
+				if serverWait, ok := retryAfter(resp, time.Now()); ok {
+					wait = serverWait
+				}
+			}
+
+			elapsed := time.Since(start)
+			if elapsed >= limit.timeout || attempt >= limit.maxAttempts {
+				reason := fmt.Sprintf("giving up after %d attempts in %s (request_retry_timeout=%s, request_retry_max_attempts=%d)", attempt, elapsed.Round(time.Millisecond), limit.timeout, limit.maxAttempts)
+				if err != nil {
+					return nil, &ErrQueryFailed{Reason: fmt.Errorf("%s: %w", reason, err)}
+				}
+				return nil, &ErrQueryFailed{StatusCode: resp.StatusCode, Reason: errors.New(reason)}
+			}
+
+			if err := rewindRequestBody(req); err != nil {
+				return nil, &ErrQueryFailed{Reason: err}
+			}
+
+			timer.Reset(min(wait, limit.timeout-elapsed))
+			delay = time.Duration(math.Min(float64(delay)*math.Phi, maxDelayBetweenRequests))
+		}
+	}
+}
+
+func (c *Conn) copyHTTPHeaders(dst http.Header) {
+	c.httpHeadersMu.RLock()
+	defer c.httpHeadersMu.RUnlock()
+	for k, v := range c.httpHeaders {
+		dst[k] = slices.Clone(v)
+	}
+}
+
+func (c *Conn) applyResponseHeaders(headers http.Header) {
+	c.httpHeadersMu.Lock()
+	defer c.httpHeadersMu.Unlock()
+	for src, dst := range responseToRequestHeaderMap {
+		if v := headers.Get(src); v != "" {
+			c.httpHeaders.Set(dst, v)
+		}
+	}
+	for _, entry := range headers.Values(trinoAddedPrepareHeader) {
+		c.replaceHeaderEntry(preparedStatementHeader, entry)
+	}
+	for _, name := range headers.Values(trinoDeallocatedPrepareHeader) {
+		c.removeHeaderEntry(preparedStatementHeader, name)
+	}
+	for _, entry := range headers.Values(trinoSetSessionHeader) {
+		c.replaceHeaderEntry(trinoSessionHeader, entry)
+		c.applySessionTimeZone(entry)
+	}
+	for _, name := range headers.Values(trinoClearSessionHeader) {
+		c.removeHeaderEntry(trinoSessionHeader, name)
+		if name == sessionTimeZoneProperty {
+			c.sessionTimeZone = nil
+		}
+	}
+	if roles := headers.Values(trinoSetRoleHeader); len(roles) > 0 {
+		c.httpHeaders.Set(trinoRoleHeader, mergeRoles(c.httpHeaders.Get(trinoRoleHeader), roles))
+	}
+	if v := headers.Get(trinoStartedTransactionHeader); v != "" {
+		c.httpHeaders.Set(trinoTransactionHeader, v)
+	}
+	if v := headers.Get(trinoClearTransactionHeader); v != "" {
+		c.httpHeaders.Set(trinoTransactionHeader, noTransactionID)
+	}
+	// Roles of the previous identity do not apply to the new one.
+	if v := headers.Get(trinoSetAuthorizationUserHeader); v != "" {
+		if c.authorizationUser == "" {
+			c.preAuthorizationRoles = c.httpHeaders.Get(trinoRoleHeader)
+		}
+		c.httpHeaders.Set(trinoUserHeader, v)
+		c.httpHeaders.Set(trinoOriginalUserHeader, c.configuredUser)
+		c.httpHeaders.Del(trinoOriginalRolesHeader)
+		// The server does not URL-encode these values.
+		for _, role := range headers.Values(trinoSetOriginalRolesHeader) {
+			c.httpHeaders.Add(trinoOriginalRolesHeader, role)
+		}
+		c.httpHeaders.Del(trinoRoleHeader)
+		c.authorizationUser = v
+	}
+	if v := headers.Get(trinoResetAuthorizationUserHeader); v != "" {
+		c.resetAuthorization()
+	}
+}
+
+// resetAuthorization reverts SET SESSION AUTHORIZATION, if active. Callers
+// must hold httpHeadersMu for writing.
+func (c *Conn) resetAuthorization() {
+	if c.authorizationUser == "" {
+		return
+	}
+	c.setConfiguredUserHeader()
+	if c.preAuthorizationRoles == "" {
+		c.httpHeaders.Del(trinoRoleHeader)
+	} else {
+		c.httpHeaders.Set(trinoRoleHeader, c.preAuthorizationRoles)
+	}
+	c.httpHeaders.Del(trinoOriginalUserHeader)
+	c.httpHeaders.Del(trinoOriginalRolesHeader)
+	c.authorizationUser = ""
+	c.preAuthorizationRoles = ""
+}
+
+type authorizationSnapshot struct {
+	user                  string
+	preAuthorizationRoles string
+	headers               http.Header
+}
+
+var authorizationHeaders = []string{trinoUserHeader, trinoOriginalUserHeader, trinoOriginalRolesHeader, trinoRoleHeader}
+
+func (c *Conn) snapshotAuthorization() authorizationSnapshot {
+	c.httpHeadersMu.RLock()
+	defer c.httpHeadersMu.RUnlock()
+	s := authorizationSnapshot{
+		user:                  c.authorizationUser,
+		preAuthorizationRoles: c.preAuthorizationRoles,
+		headers:               http.Header{},
+	}
+	for _, name := range authorizationHeaders {
+		if v := c.httpHeaders.Values(name); v != nil {
+			s.headers[name] = slices.Clone(v)
+		}
+	}
+	return s
+}
+
+// restoreAuthorization undoes an authorization change made by a statement
+// that failed afterwards.
+func (c *Conn) restoreAuthorization(s authorizationSnapshot) {
+	c.httpHeadersMu.Lock()
+	defer c.httpHeadersMu.Unlock()
+	if c.authorizationUser == s.user {
+		return
+	}
+	for _, name := range authorizationHeaders {
+		if v, ok := s.headers[name]; ok {
+			c.httpHeaders[name] = v
+		} else {
+			c.httpHeaders.Del(name)
+		}
+	}
+	c.authorizationUser = s.user
+	c.preAuthorizationRoles = s.preAuthorizationRoles
+}
+
+// Callers must hold httpHeadersMu for writing.
+func (c *Conn) setConfiguredUserHeader() {
+	if c.configuredUser == "" {
+		c.httpHeaders.Del(trinoUserHeader)
+		return
+	}
+	c.httpHeaders.Set(trinoUserHeader, c.configuredUser)
+}
+
+// Callers must hold httpHeadersMu for writing.
+func (c *Conn) setConfiguredRolesHeader() {
+	if c.configuredRoles == "" {
+		c.httpHeaders.Del(trinoRoleHeader)
+		return
+	}
+	c.httpHeaders.Set(trinoRoleHeader, c.configuredRoles)
+}
+
+// applySessionTimeZone follows a SET TIME ZONE reported by the server, so
+// values without a zone are read the way the server now produces them.
+func (c *Conn) applySessionTimeZone(entry string) {
+	name, encodedValue, _ := strings.Cut(entry, "=")
+	if name != sessionTimeZoneProperty {
+		return
+	}
+	value, err := url.QueryUnescape(encodedValue)
+	if err != nil {
+		return
+	}
+	// The server accepted the zone; if Go cannot load it, keep the previous one.
+	if location, err := resolveTimeZone(value); err == nil {
+		c.sessionTimeZone = location
+	}
+}
+
+// location returns the zone the server produces values without a time zone
+// in.
+func (c *Conn) location() *time.Location {
+	c.httpHeadersMu.RLock()
+	defer c.httpHeadersMu.RUnlock()
+	if c.sessionTimeZone != nil {
+		return c.sessionTimeZone
+	}
+	return c.timeZone
+}
+
+// replaceHeaderEntry stores a name=value entry in a multi-valued header,
+// dropping any entry that already carries the same name.
+func (c *Conn) replaceHeaderEntry(key, entry string) {
+	name, _, _ := strings.Cut(entry, "=")
+	c.removeHeaderEntry(key, name)
+	c.httpHeaders.Add(key, entry)
+}
+
+func (c *Conn) removeHeaderEntry(key, name string) {
+	values := c.httpHeaders.Values(key)
+	c.httpHeaders.Del(key)
+	for _, value := range values {
+		if !strings.HasPrefix(value, name+"=") {
+			c.httpHeaders.Add(key, value)
+		}
+	}
+}
+
+// mergeRoles applies catalog=role updates to the comma-separated roles
+// header, replacing the entry of each updated catalog and keeping the rest.
+// Updates are split at commas like the header itself, and an entry without
+// a catalog is dropped, so the result has the shape the server reads back.
+func mergeRoles(current string, updates []string) string {
+	entries := strings.Split(current, commaSeparator)
+	for _, update := range updates {
+		entries = append(entries, strings.Split(update, commaSeparator)...)
+	}
+	roles := map[string]string{}
+	for _, entry := range entries {
+		catalog, role, ok := strings.Cut(entry, "=")
+		if !ok || catalog == "" {
+			continue
+		}
+		roles[catalog] = role
+	}
+	merged := make([]string, 0, len(roles))
+	for catalog, role := range roles {
+		merged = append(merged, catalog+"="+role)
+	}
+	sort.Strings(merged)
+	return strings.Join(merged, commaSeparator)
+}
+
+func (c *Conn) setHTTPHeader(name, value string) {
+	c.httpHeadersMu.Lock()
+	defer c.httpHeadersMu.Unlock()
+	c.httpHeaders.Set(name, value)
+}
+
+func (c *Conn) httpHeaderValues(name string) []string {
+	c.httpHeadersMu.RLock()
+	defer c.httpHeadersMu.RUnlock()
+	return slices.Clone(c.httpHeaders.Values(name))
+}
+
+func (c *Conn) httpHeaderValue(name string) string {
+	c.httpHeadersMu.RLock()
+	defer c.httpHeadersMu.RUnlock()
+	return c.httpHeaders.Get(name)
+}
+
+func (c *Conn) deleteHTTPHeader(name string) {
+	c.httpHeadersMu.Lock()
+	defer c.httpHeadersMu.Unlock()
+	c.httpHeaders.Del(name)
+}
+
+// ErrQueryFailed indicates that a query to Trino failed.
+type ErrQueryFailed struct {
+	StatusCode int
+	Reason     error
+}
+
+// Error implements the error interface.
+func (e *ErrQueryFailed) Error() string {
+	return fmt.Sprintf("trino: query failed (%d %s): %q",
+		e.StatusCode, http.StatusText(e.StatusCode), e.Reason)
+}
+
+// Unwrap implements the unwrap interface.
+func (e *ErrQueryFailed) Unwrap() error {
+	return e.Reason
+}
+
+func newErrQueryFailedFromResponse(resp *http.Response) *ErrQueryFailed {
+	const maxBytes = 8 * 1024
+	defer resp.Body.Close()
+	qf := &ErrQueryFailed{StatusCode: resp.StatusCode}
+	b, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes))
+	if err != nil {
+		qf.Reason = err
+		return qf
+	}
+	reason := string(b)
+	if resp.ContentLength > maxBytes {
+		reason += "..."
+	}
+	qf.Reason = errors.New(reason)
+	return qf
+}
+
+type driverStmt struct {
+	conn  *Conn
+	query string
+	// executions are the runs of the statement that are not stopped yet. A
+	// prepared statement can run again while rows of an earlier run are
+	// open, and those rows keep reading their own run. database/sql
+	// serializes the calls on a connection, so this needs no lock.
+	executions map[*execution]struct{}
+}
+
+// execution is one run of a statement: the goroutines that fetch its pages,
+// download and decode its spooled segments and report its progress, and the
+// settings that its named arguments chose for this run only.
+type execution struct {
+	conn                          *Conn
+	user                          string
+	timeZone                      *time.Location
+	warnings                      *Warnings
+	nextURIs                      chan string
+	httpResponses                 chan *http.Response
+	queryResponses                chan queryResponse
+	statsCh                       chan QueryProgressInfo
+	progressDone                  chan struct{}
+	usingSpooledProtocol          bool
+	spoolingMaxOutOfOrderSegments int
+	spoolingWorkerCount           int
+	spooledSegmentsMetadata       chan spooledMetadata
+	spooledSegmentsToDecode       chan segmentToDecode
+	decodedSegments               chan decodedSegment
+	segmentsToProccess            chan segmentToProccess
+	waitSegmentDecodersWorkers    sync.WaitGroup
+	waitDownloadSegmentsWorkers   sync.WaitGroup
+	cancelDownloadWorkers         context.CancelFunc
+	cancelDecodersWorkers         context.CancelFunc
+	spoolingRowsChannel           chan []queryData
+	spoolingProcesserDone         chan struct{}
+	segmentThrottleCh             chan struct{}
+	errors                        chan error
+	doneCh                        chan struct{}
+	segmentDispatcherDoneCh       chan struct{}
+	heartbeatInterval             time.Duration
+	heartbeatNextURICh            chan string
+	cancelHeartbeat               context.CancelFunc
+	waitHeartbeat                 sync.WaitGroup
+	// cancelQuery ends the context of the running query, which aborts a
+	// nextUri request still in flight.
+	cancelQuery context.CancelFunc
+	// stopped is set once stop has run.
+	stopped bool
+	// spoolingProcessorExited is closed when proccessSpollingSegments returns.
+	spoolingProcessorExited chan struct{}
+	waitSegmentAcks         sync.WaitGroup
+	failedSegmentAcks       atomic.Int64
+	lastProgress            QueryProgressInfo
+	// progressUpdater and progressUpdaterPeriod come from the named arguments
+	// of this execution only, so a query run without them, on the same
+	// connection or the same prepared statement, does not report to the
+	// callback of an earlier one.
+	progressUpdater       ProgressUpdater
+	progressUpdaterPeriod queryProgressCallbackPeriod
+}
+
+type segmentToDecode struct {
+	segmentIndex int
+	encoding     string
+	data         []byte
+	metadata     segmentMetadata
+}
+
+type decodedSegment struct {
+	rowOffset int64
+	queryData []queryData
+}
+
+var (
+	_ driver.Stmt              = &driverStmt{}
+	_ driver.StmtQueryContext  = &driverStmt{}
+	_ driver.StmtExecContext   = &driverStmt{}
+	_ driver.NamedValueChecker = &driverStmt{}
+)
+
+// Close closes statement just before releasing connection
+func (st *driverStmt) Close() error {
+	for ex := range st.executions {
+		st.stopExecution(ex)
+	}
+	return nil
+}
+
+// stopExecution stops one run of the statement and forgets it.
+func (st *driverStmt) stopExecution(ex *execution) {
+	ex.stop()
+	delete(st.executions, ex)
+}
+
+// stop stops the goroutines of the execution and waits for them, so nothing
+// from its query reaches the connection. It is a no-op once the execution is
+// stopped, or when its query never started.
+func (ex *execution) stop() {
+	if ex.stopped {
+		return
+	}
+	ex.stopped = true
+	if ex.cancelQuery != nil {
+		ex.cancelQuery()
+	}
+	if ex.doneCh == nil {
+		return
+	}
+	close(ex.doneCh)
+	if ex.progressDone != nil {
+		<-ex.progressDone
+	}
+	errs := ex.errors
+	go func() {
+		// drain errors chan to allow goroutines to write to it
+		for range errs {
+		}
+	}()
+
+	for range ex.queryResponses {
+	}
+	for range ex.httpResponses {
+	}
+
+	if ex.cancelDownloadWorkers != nil {
+		ex.cancelDownloadWorkers()
+	}
+
+	if ex.cancelDecodersWorkers != nil {
+		ex.cancelDecodersWorkers()
+	}
+
+	if ex.spoolingRowsChannel != nil {
+		for range ex.spoolingRowsChannel {
+		}
+	}
+
+	if ex.decodedSegments != nil {
+		for range ex.decodedSegments {
+		}
+	}
+
+	if ex.spooledSegmentsToDecode != nil {
+		for range ex.spooledSegmentsToDecode {
+		}
+	}
+
+	if ex.spooledSegmentsMetadata != nil {
+		for range ex.spooledSegmentsMetadata {
+		}
+	}
+
+	if ex.segmentsToProccess != nil {
+		for range ex.segmentsToProccess {
+		}
+	}
+
+	if ex.spoolingProcessorExited != nil {
+		<-ex.spoolingProcessorExited
+	}
+
+	ex.waitDownloadSegmentsWorkers.Wait()
+
+	ex.waitSegmentDecodersWorkers.Wait()
+
+	if ex.cancelHeartbeat != nil {
+		ex.cancelHeartbeat()
+	}
+	ex.waitHeartbeat.Wait()
+
+	// Acknowledgments can finish after the last progress update, so report
+	// failures among them once they are all done.
+	if ex.progressUpdater != nil && ex.usingSpooledProtocol {
+		ex.waitSegmentAcks.Wait()
+		if failed := ex.failedSegmentAcks.Load(); failed > ex.lastProgress.FailedSegmentAcknowledgments {
+			ex.lastProgress.FailedSegmentAcknowledgments = failed
+			ex.progressUpdater.Update(ex.lastProgress)
+		}
+	}
+
+	close(ex.nextURIs)
+	close(ex.errors)
+}
+
+func (st *driverStmt) NumInput() int {
+	return -1
+}
+
+func (st *driverStmt) Exec(args []driver.Value) (driver.Result, error) {
+	return nil, driver.ErrSkip
+}
+
+func (st *driverStmt) ExecContext(ctx context.Context, args []driver.NamedValue) (driver.Result, error) {
+	authorization := st.conn.snapshotAuthorization()
+	ex, sr, err := st.exec(ctx, args)
+	if err != nil {
+		st.conn.restoreAuthorization(authorization)
+		return nil, err
+	}
+	rows := &driverRows{
+		ctx:          ctx,
+		stmt:         st,
+		exec:         ex,
+		queryID:      sr.ID,
+		nextURI:      sr.NextURI,
+		rowsAffected: sr.UpdateCount,
+	}
+	// consume all results, if there are any
+	for err == nil {
+		err = rows.fetch()
+		// Once the result switches to the spooling protocol, its pages are
+		// read by the spooling goroutines; read the rows they produce.
+		if err == nil && ex.usingSpooledProtocol {
+			err = rows.drainSpooledRows()
+		}
+	}
+
+	if err != nil && err != io.EOF {
+		// The polling goroutines may already be fetching the next page;
+		// stop them before the connection goes back to the pool, or that
+		// page's headers would change the next caller's session.
+		st.stopExecution(ex)
+		rows.cancelAbandonedQuery(err)
+		st.conn.restoreAuthorization(authorization)
+		return nil, err
+	}
+	// No rows are left to close the execution.
+	st.stopExecution(ex)
+	return rows, nil
+}
+
+func (st *driverStmt) CheckNamedValue(arg *driver.NamedValue) error {
+	switch arg.Value.(type) {
+	case nil:
+		return nil
+	case Numeric, trinoDate, trinoTime, trinoTimeTz, trinoTimestamp, time.Duration, Interval:
+		return nil
+	default:
+		{
+			if kind := reflect.TypeOf(arg.Value).Kind(); kind == reflect.Slice || kind == reflect.Map {
+				return nil
+			}
+
+			if arg.Name == trinoRoleHeader || arg.Name == trinoResourceEstimateHeader {
+				return nil
+			}
+
+			if arg.Name == trinoProgressCallbackParam {
+				return nil
+			}
+			if arg.Name == trinoProgressCallbackPeriodParam {
+				return nil
+			}
+			if arg.Name == trinoWarningsParam {
+				return nil
+			}
+		}
+	}
+
+	return driver.ErrSkip
+}
+
+type stmtResponse struct {
+	ID          string    `json:"id"`
+	InfoURI     string    `json:"infoUri"`
+	NextURI     string    `json:"nextUri"`
+	Stats       stmtStats `json:"stats"`
+	Error       ErrTrino  `json:"error"`
+	UpdateType  string    `json:"updateType"`
+	UpdateCount int64     `json:"updateCount"`
+	Warnings    []Warning `json:"warnings"`
+}
+
+type stmtStats struct {
+	State                string      `json:"state"`
+	Scheduled            bool        `json:"scheduled"`
+	Nodes                int         `json:"nodes"`
+	TotalSplits          int         `json:"totalSplits"`
+	QueuesSplits         int         `json:"queuedSplits"`
+	RunningSplits        int         `json:"runningSplits"`
+	CompletedSplits      int         `json:"completedSplits"`
+	UserTimeMillis       int         `json:"userTimeMillis"`
+	CPUTimeMillis        int64       `json:"cpuTimeMillis"`
+	WallTimeMillis       int64       `json:"wallTimeMillis"`
+	QueuedTimeMillis     int64       `json:"queuedTimeMillis"`
+	ElapsedTimeMillis    int64       `json:"elapsedTimeMillis"`
+	ProcessedRows        int64       `json:"processedRows"`
+	ProcessedBytes       int64       `json:"processedBytes"`
+	PhysicalInputBytes   int64       `json:"physicalInputBytes"`
+	PhysicalWrittenBytes int64       `json:"physicalWrittenBytes"`
+	PeakMemoryBytes      int64       `json:"peakMemoryBytes"`
+	SpilledBytes         int64       `json:"spilledBytes"`
+	RootStage            stmtStage   `json:"rootStage"`
+	ProgressPercentage   jsonFloat64 `json:"progressPercentage"`
+	RunningPercentage    jsonFloat64 `json:"runningPercentage"`
+}
+
+type ErrTrino struct {
+	Message       string        `json:"message"`
+	SqlState      string        `json:"sqlState"`
+	ErrorCode     int           `json:"errorCode"`
+	ErrorName     string        `json:"errorName"`
+	ErrorType     string        `json:"errorType"`
+	ErrorLocation ErrorLocation `json:"errorLocation"`
+	FailureInfo   FailureInfo   `json:"failureInfo"`
+}
+
+func (i ErrTrino) Error() string {
+	return i.ErrorType + ": " + i.Message
+}
+
+type ErrorLocation struct {
+	LineNumber   int `json:"lineNumber"`
+	ColumnNumber int `json:"columnNumber"`
+}
+
+type FailureInfo struct {
+	Type          string        `json:"type"`
+	Message       string        `json:"message"`
+	Cause         *FailureInfo  `json:"cause"`
+	Suppressed    []FailureInfo `json:"suppressed"`
+	Stack         []string      `json:"stack"`
+	ErrorInfo     ErrorInfo     `json:"errorInfo"`
+	ErrorLocation ErrorLocation `json:"errorLocation"`
+}
+
+type ErrorInfo struct {
+	Code int    `json:"code"`
+	Name string `json:"name"`
+	Type string `json:"type"`
+}
+
+func (i ErrorInfo) Error() string {
+	return fmt.Sprintf("%s: %s (%d)", i.Type, i.Name, i.Code)
+}
+
+type stmtStage struct {
+	StageID         string      `json:"stageId"`
+	State           string      `json:"state"`
+	Done            bool        `json:"done"`
+	Nodes           int         `json:"nodes"`
+	TotalSplits     int         `json:"totalSplits"`
+	QueuedSplits    int         `json:"queuedSplits"`
+	RunningSplits   int         `json:"runningSplits"`
+	CompletedSplits int         `json:"completedSplits"`
+	UserTimeMillis  int         `json:"userTimeMillis"`
+	CPUTimeMillis   int         `json:"cpuTimeMillis"`
+	WallTimeMillis  int         `json:"wallTimeMillis"`
+	ProcessedRows   int         `json:"processedRows"`
+	ProcessedBytes  int         `json:"processedBytes"`
+	SubStages       []stmtStage `json:"subStages"`
+}
+
+type jsonFloat64 float64
+
+// UnmarshalJSONFrom decodes anything but a number, like the empty string
+// some servers send for the progress of a query, as zero.
+func (f *jsonFloat64) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
+	if dec.PeekKind() != '0' {
+		*f = 0
+		return dec.SkipValue()
+	}
+	token, err := dec.ReadToken()
+	if err != nil {
+		return err
+	}
+	value, err := token.Float()
+	if err != nil {
+		return err
+	}
+	*f = jsonFloat64(value)
+	return nil
+}
+
+var _ json.UnmarshalerFrom = new(jsonFloat64)
+
+func (st *driverStmt) Query(args []driver.Value) (driver.Rows, error) {
+	return nil, driver.ErrSkip
+}
+
+func (st *driverStmt) QueryContext(ctx context.Context, args []driver.NamedValue) (driver.Rows, error) {
+	authorization := st.conn.snapshotAuthorization()
+	ex, sr, err := st.exec(ctx, args)
+	if err != nil {
+		st.conn.restoreAuthorization(authorization)
+		return nil, err
+	}
+	rows := &driverRows{
+		ctx:           ctx,
+		stmt:          st,
+		exec:          ex,
+		queryID:       sr.ID,
+		nextURI:       sr.NextURI,
+		authorization: &authorization,
+	}
+	if err = rows.fetch(); err != nil && err != io.EOF {
+		// As in ExecContext: stop the query before the connection can be
+		// reused.
+		st.stopExecution(ex)
+		rows.cancelAbandonedQuery(err)
+		st.conn.restoreAuthorization(authorization)
+		return nil, err
+	}
+	return rows, nil
+}
+
+func (st *driverStmt) exec(ctx context.Context, args []driver.NamedValue) (*execution, *stmtResponse, error) {
+	query := st.query
+	// A prepared statement is executed more than once. Each execution starts
+	// from the connection's settings rather than the named arguments an
+	// earlier execution passed.
+	ex := &execution{conn: st.conn}
+	hs := make(http.Header)
+	hs.Add(trinoClientCapabilitiesHeader, clientCapabilities)
+	// The server reads extra credentials only when the statement is submitted.
+	if len(st.conn.extraCredentials) > 0 {
+		hs[trinoExtraCredentialHeader] = slices.Clone(st.conn.extraCredentials)
+	}
+	resourceEstimates := st.conn.resourceEstimates
+
+	if len(args) > 0 {
+		var ss []string
+		for _, arg := range args {
+			if queryEstimates, ok := arg.Value.(map[string]string); arg.Name == trinoResourceEstimateHeader && ok {
+				resourceEstimates = maps.Clone(resourceEstimates)
+				if resourceEstimates == nil {
+					resourceEstimates = make(map[string]string, len(queryEstimates))
+				}
+				maps.Copy(resourceEstimates, queryEstimates)
+				continue
+			}
+			if arg.Name == trinoProgressCallbackParam {
+				updater, ok := arg.Value.(ProgressUpdater)
+				if !ok {
+					return nil, nil, fmt.Errorf("trino: %s must be a ProgressUpdater, got %T", trinoProgressCallbackParam, arg.Value)
+				}
+				ex.progressUpdater = updater
+				continue
+			}
+			if arg.Name == trinoProgressCallbackPeriodParam {
+				period, ok := arg.Value.(time.Duration)
+				if !ok {
+					return nil, nil, fmt.Errorf("trino: %s must be a time.Duration, got %T", trinoProgressCallbackPeriodParam, arg.Value)
+				}
+				ex.progressUpdaterPeriod.Period = period
+				continue
+			}
+
+			if arg.Name == accessTokenConfig {
+				if !st.conn.forwardAuthorizationHeader {
+					return nil, nil, ErrForwardAuthorizationHeaderNotEnabled
+				}
+				token, ok := arg.Value.(string)
+				if !ok {
+					return nil, nil, fmt.Errorf("trino: %s must be a string, got %T", accessTokenConfig, arg.Value)
+				}
+				// An empty token would not authenticate the caller: the
+				// request would go out with the connection's password, or
+				// with no credentials at all.
+				if token == "" {
+					return nil, nil, fmt.Errorf("trino: %s must not be empty", accessTokenConfig)
+				}
+				hs.Add(authorizationHeader, getAuthorization(token))
+				continue
+			}
+
+			if arg.Name == trinoEncoding {
+				encoding, err := namedStringArg(arg)
+				if err != nil {
+					return nil, nil, err
+				}
+				hs.Add(trinoQueryDataEncodingHeader, encoding)
+				continue
+			}
+
+			if arg.Name == trinoSpoolingWorkerCount {
+				numberOfWorkers, err := namedIntArg(arg)
+				if err != nil {
+					return nil, nil, err
+				}
+				ex.spoolingWorkerCount = numberOfWorkers
+				continue
+			}
+
+			if arg.Name == trinoMaxOutOfOrdersSegments {
+				maxSegmentsOutOfOrder, err := namedIntArg(arg)
+				if err != nil {
+					return nil, nil, err
+				}
+				ex.spoolingMaxOutOfOrderSegments = maxSegmentsOutOfOrder
+				continue
+			}
+
+			if arg.Name == trinoWarningsParam {
+				warnings, ok := arg.Value.(*Warnings)
+				if !ok {
+					return nil, nil, fmt.Errorf("trino: %s must be a *trino.Warnings, got %T", arg.Name, arg.Value)
+				}
+				ex.warnings = warnings
+				continue
+			}
+
+			if strings.HasPrefix(arg.Name, trinoHeaderPrefix) {
+				headerValue, err := formatHeaderValue(arg.Name, arg.Value)
+				if err != nil {
+					return nil, nil, err
+				}
+
+				if arg.Name == trinoUserHeader {
+					ex.user = headerValue
+				}
+
+				if arg.Name == trinoTimeZoneHeader {
+					ex.timeZone, err = resolveTimeZone(headerValue)
+					if err != nil {
+						return nil, nil, err
+					}
+				}
+
+				if arg.Name == trinoRoleHeader {
+					st.conn.setHTTPHeader(trinoRoleHeader, headerValue)
+				}
+
+				hs.Add(arg.Name, headerValue)
+			} else {
+				s, err := Serial(arg.Value)
+				if err != nil {
+					return nil, nil, err
+				}
+
+				if st.conn.useExplicitPrepare && hs.Get(preparedStatementHeader) == "" {
+					for _, v := range st.conn.httpHeaderValues(preparedStatementHeader) {
+						hs.Add(preparedStatementHeader, v)
+					}
+					hs.Add(preparedStatementHeader, preparedStatementName+"="+url.QueryEscape(st.query))
+				}
+				ss = append(ss, s)
+			}
+		}
+		if (ex.progressUpdater != nil && ex.progressUpdaterPeriod.Period == 0) || (ex.progressUpdater == nil && ex.progressUpdaterPeriod.Period > 0) {
+			return nil, nil, ErrInvalidProgressCallbackHeader
+		}
+		if len(ss) > 0 {
+			if st.conn.useExplicitPrepare {
+				query = "EXECUTE " + preparedStatementName + " USING " + strings.Join(ss, ", ")
+			} else {
+				query = "EXECUTE IMMEDIATE " + formatStringLiteral(st.query) + " USING " + strings.Join(ss, ", ")
+			}
+		}
+	}
+
+	if len(resourceEstimates) > 0 {
+		encoded, err := encodeResourceEstimates(resourceEstimates)
+		if err != nil {
+			return nil, nil, err
+		}
+		hs[trinoResourceEstimateHeader] = append(encoded, hs.Values(trinoResourceEstimateHeader)...)
+	}
+
+	if ex.spoolingWorkerCount > ex.spoolingMaxOutOfOrderSegments {
+		return nil, nil, fmt.Errorf("spooling worker cannot be greater than max out of order segments allowed. spooling workers: %d, allowed out of order segments: %d", ex.spoolingWorkerCount, ex.spoolingMaxOutOfOrderSegments)
+	}
+
+	if hs.Get(trinoQueryDataEncodingHeader) == "" {
+		hs.Add(trinoQueryDataEncodingHeader, defaulttrinoEncoding)
+	}
+
+	ctx, cancelQuery := context.WithCancel(ctx)
+	cancel := cancelQuery
+	if st.conn.queryTimeout != nil {
+		var cancelTimeout context.CancelFunc
+		ctx, cancelTimeout = context.WithTimeout(ctx, *st.conn.queryTimeout)
+		cancel = func() { cancelTimeout(); cancelQuery() }
+	} else if _, ok := ctx.Deadline(); !ok {
+		var cancelTimeout context.CancelFunc
+		ctx, cancelTimeout = context.WithTimeout(ctx, DefaultQueryTimeout)
+		cancel = func() { cancelTimeout(); cancelQuery() }
+	}
+
+	req, err := st.conn.newRequest(ctx, "POST", st.conn.baseURL+"/v1/statement", strings.NewReader(query), hs)
+	if err != nil {
+		cancel()
+		return nil, nil, st.conn.unsentRequestError(err)
+	}
+	req.Header.Set(contentTypeHeader, statementMediaType)
+
+	resp, err := st.conn.roundTrip(ctx, req)
+	if err != nil {
+		cancel()
+		return nil, nil, err
+	}
+
+	defer resp.Body.Close()
+	var sr stmtResponse
+	err = json.UnmarshalRead(resp.Body, &sr)
+	if err != nil {
+		cancel()
+		return nil, nil, fmt.Errorf("trino: %w", err)
+	}
+	if ex.warnings != nil {
+		ex.warnings.add(sr.Warnings)
+	}
+
+	ex.cancelQuery = cancel
+	if st.executions == nil {
+		st.executions = make(map[*execution]struct{})
+	}
+	st.executions[ex] = struct{}{}
+	ex.doneCh = make(chan struct{})
+	ex.nextURIs = make(chan string)
+	ex.httpResponses = make(chan *http.Response)
+	ex.queryResponses = make(chan queryResponse)
+	ex.errors = make(chan error)
+	go func() {
+		defer close(ex.httpResponses)
+		for {
+			select {
+			case nextURI := <-ex.nextURIs:
+				if nextURI == "" {
+					return
+				}
+				hs := make(http.Header)
+				if ex.user != "" {
+					hs.Add(trinoUserHeader, ex.user)
+				}
+				req, err := st.conn.newRequest(ctx, "GET", nextURI, nil, hs)
+				if err != nil {
+					if ctx.Err() == context.Canceled {
+						ex.errors <- context.Canceled
+						return
+					}
+					ex.errors <- err
+					return
+				}
+				resp, err := st.conn.roundTrip(ctx, req)
+				if err != nil {
+					if ctx.Err() == context.Canceled {
+						ex.errors <- context.Canceled
+						return
+					}
+					ex.errors <- err
+					return
+				}
+				select {
+				case ex.httpResponses <- resp:
+				case <-ex.doneCh:
+					return
+				}
+			case <-ex.doneCh:
+				return
+			}
+		}
+	}()
+	go func() {
+		defer close(ex.queryResponses)
+		defer cancel()
+		for {
+			select {
+			case resp := <-ex.httpResponses:
+				if resp == nil {
+					return
+				}
+				var qresp queryResponse
+				err = json.UnmarshalRead(resp.Body, &qresp)
+				if err != nil {
+					ex.errors <- fmt.Errorf("trino: %w", err)
+					return
+				}
+				err = resp.Body.Close()
+				if err != nil {
+					ex.errors <- err
+					return
+				}
+				err = handleResponseError(resp.StatusCode, qresp.Error)
+				if err != nil {
+					ex.errors <- err
+					return
+				}
+				select {
+				case ex.nextURIs <- qresp.NextURI:
+				case <-ex.doneCh:
+					return
+				}
+				select {
+				case ex.queryResponses <- qresp:
+				case <-ex.doneCh:
+					return
+				}
+			case <-ex.doneCh:
+				return
+			}
+		}
+	}()
+	ex.nextURIs <- sr.NextURI
+	if updater := ex.progressUpdater; updater != nil {
+		ex.statsCh = make(chan QueryProgressInfo)
+		ex.progressDone = make(chan struct{})
+
+		// progress updater go func. It never closes statsCh: the spooling
+		// processor may still send on it after stop, and a send on a
+		// closed channel panics. stop waits for progressDone instead.
+		go func() {
+			defer close(ex.progressDone)
+			for {
+				select {
+				case stats := <-ex.statsCh:
+					updater.Update(stats)
+				case <-ex.doneCh:
+					return
+				}
+			}
+		}()
+
+		// initial progress callback call
+		srStats := QueryProgressInfo{
+			QueryId:    sr.ID,
+			QueryStats: sr.Stats,
+		}
+		ex.failedSegmentAcks.Store(0)
+		ex.lastProgress = srStats
+		select {
+		case ex.statsCh <- srStats:
+		case <-ex.doneCh:
+		}
+		ex.progressUpdaterPeriod.LastCallbackTime = time.Now()
+		ex.progressUpdaterPeriod.LastQueryState = sr.Stats.State
+	}
+	if err := handleResponseError(resp.StatusCode, sr.Error); err != nil {
+		st.stopExecution(ex)
+		return nil, nil, err
+	}
+	return ex, &sr, nil
+}
+
+// SegmentExpiredError reports a spooled segment download that failed after
+// the time the server said the segment may be removed from storage, which
+// happens when the rows are read too slowly. Err is the download error.
+type SegmentExpiredError struct {
+	URI       string
+	ExpiresAt time.Time
+	Err       error
+}
+
+// Error implements the error interface.
+func (e *SegmentExpiredError) Error() string {
+	return fmt.Sprintf("trino: spooled segment from uri '%s' expired at %s: %v",
+		e.URI, e.ExpiresAt.Format(time.RFC3339Nano), e.Err)
+}
+
+// Unwrap implements the unwrap interface.
+func (e *SegmentExpiredError) Unwrap() error {
+	return e.Err
+}
+
+type SegmentFetcher struct {
+	ctx             context.Context
+	httpClient      http.Client
+	spooledMetadata spooledMetadata
+	acks            *sync.WaitGroup
+	failedAcks      *atomic.Int64
+	retryLimit      retryLimit
+}
+
+func (sf *SegmentFetcher) roundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := roundTrip(sf.ctx, &sf.httpClient, req, sf.retryLimit, segmentDownloadInitialDelay, transientNetworkError)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, newErrQueryFailedFromResponse(resp)
+	}
+	return resp, nil
+}
+
+func (sf *SegmentFetcher) fetchSegment() ([]byte, error) {
+	req, err := http.NewRequestWithContext(sf.ctx, "GET", sf.spooledMetadata.uri, nil)
+	if err != nil {
+		return nil, err
+	}
+	// The acknowledgment copies these headers, so it carries the User-Agent too.
+	req.Header.Set(userAgentHeader, userAgent)
+
+	for name, values := range sf.spooledMetadata.headers {
+		for _, value := range values {
+			req.Header.Add(name, value)
+		}
+	}
+
+	resp, err := sf.roundTrip(req)
+	if err != nil {
+		if sf.expired() {
+			return nil, &SegmentExpiredError{URI: sf.spooledMetadata.uri, ExpiresAt: sf.spooledMetadata.expiresAt, Err: err}
+		}
+		return nil, fmt.Errorf("error fetching segment from uri '%s': %w", sf.spooledMetadata.uri, err)
+	}
+
+	// Read one byte past the declared size, so a longer body is detected
+	// without reading all of it.
+	segmentSize := sf.spooledMetadata.metadata.segmentSize
+	data, err := io.ReadAll(io.LimitReader(resp.Body, segmentSize+1))
+	resp.Body.Close()
+	if err != nil {
+		return nil, fmt.Errorf("error reading response body: %w", err)
+	}
+
+	// A failed acknowledgment leaves the segment in storage until it expires
+	// but does not affect the rows already read, so it is only counted.
+	if sf.acks != nil {
+		sf.acks.Add(1)
+	}
+	go func() {
+		if sf.acks != nil {
+			defer sf.acks.Done()
+		}
+		// The download workers are stopped as soon as the last row is
+		// consumed, which can be before this goroutine runs; the
+		// acknowledgement must outlive them.
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(sf.ctx), DefaultCancelQueryTimeout)
+		defer cancel()
+		ackReq, err := http.NewRequestWithContext(ctx, "GET", sf.spooledMetadata.ackUri, nil)
+		if err != nil {
+			sf.ackFailed()
+			return
+		}
+
+		for k, values := range req.Header {
+			for _, v := range values {
+				ackReq.Header.Add(k, v)
+			}
+		}
+
+		resp, err := sf.httpClient.Do(ackReq)
+		if err != nil {
+			sf.ackFailed()
+			return
+		}
+		resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			sf.ackFailed()
+		}
+	}()
+
+	// A segment that does not match its metadata is still acknowledged: the
+	// query fails, so the segment is never read again.
+	if int64(len(data)) > segmentSize {
+		return nil, fmt.Errorf("failed to fetch spooled segment at index %d: segment size mismatch: expected %d bytes, got more",
+			sf.spooledMetadata.segmentIndex, segmentSize)
+	}
+	if int64(len(data)) < segmentSize {
+		return nil, fmt.Errorf("failed to fetch spooled segment at index %d: segment size mismatch: expected %d bytes, got %d bytes",
+			sf.spooledMetadata.segmentIndex, segmentSize, len(data))
+	}
+	return data, nil
+}
+
+// expired reports whether a failed download is explained by the segment's
+// expiration. A cancelled query is not, even if the segment expired meanwhile.
+func (sf *SegmentFetcher) expired() bool {
+	expiresAt := sf.spooledMetadata.expiresAt
+	return !expiresAt.IsZero() && sf.ctx.Err() == nil && time.Now().After(expiresAt)
+}
+
+func (sf *SegmentFetcher) ackFailed() {
+	if sf.failedAcks != nil {
+		sf.failedAcks.Add(1)
+	}
+}
+
+func formatStringLiteral(query string) string {
+	return "'" + strings.ReplaceAll(query, "'", "''") + "'"
+}
+
+type driverRows struct {
+	ctx     context.Context
+	stmt    *driverStmt
+	exec    *execution
+	queryID string
+	nextURI string
+
+	err          error
+	rowindex     int
+	columns      []string
+	coltype      []*columnType
+	decoder      *rowsDecoder
+	data         []queryData
+	rowsAffected int64
+
+	// authorization is restored if the query fails while reading rows.
+	authorization *authorizationSnapshot
+}
+
+var _ driver.Rows = &driverRows{}
+var _ driver.Result = &driverRows{}
+var _ driver.RowsColumnTypeScanType = &driverRows{}
+var _ driver.RowsColumnTypeDatabaseTypeName = &driverRows{}
+var _ driver.RowsColumnTypeLength = &driverRows{}
+var _ driver.RowsColumnTypePrecisionScale = &driverRows{}
+var _ driver.RowsColumnTypeNullable = &driverRows{}
+
+// Close closes the rows iterator.
+func (qr *driverRows) Close() error {
+	// The statement may outlive the rows, as a prepared statement does, and
+	// the connection goes back to the pool once the rows are closed, even
+	// when every row was read.
+	defer qr.stmt.stopExecution(qr.exec)
+	if qr.err == sql.ErrNoRows || qr.err == io.EOF {
+		return nil
+	}
+	qr.err = io.EOF
+	if !qr.exec.usingSpooledProtocol {
+		err := qr.fetch()
+		if err != nil && err != io.EOF {
+			return err
+		}
+	} else {
+		select {
+		case _, ok := <-qr.exec.spoolingRowsChannel:
+			if !ok {
+				// channel is closed, all data has been consumed
+				return nil
+			}
+		case <-time.NewTimer(100 * time.Millisecond).C:
+			// no data is ready
+		}
+	}
+	return qr.cancelQueryOnServer()
+}
+
+// cancelAbandonedQuery cancels a query that ended with err before its rows
+// reached the caller, so nothing else would close them, and the server would
+// keep running the query until it stops waiting for the client. A query that
+// failed on the server needs no cancel, and one without a nextURI has
+// finished or was already cancelled when fetch closed the rows.
+func (qr *driverRows) cancelAbandonedQuery(err error) {
+	var trinoErr *ErrTrino
+	if qr.nextURI == "" || errors.As(err, &trinoErr) || errors.Is(err, ErrQueryCancelled) {
+		return
+	}
+	// The caller gets err, which ended the query, and not an error of the
+	// cancel, which is best effort.
+	_ = qr.cancelQueryOnServer()
+}
+
+// cancelQueryOnServer asks the coordinator to cancel the query.
+func (qr *driverRows) cancelQueryOnServer() error {
+	// The client protocol cancels a query with a DELETE to its nextUri, which
+	// gateways such as Starburst Galaxy route like the other statement
+	// requests. Any nextUri of the query works, also one already fetched by
+	// the spooling workers, and without one the query has finished.
+	if qr.nextURI == "" {
+		return nil
+	}
+	err := qr.deleteQuery(qr.nextURI)
+	// A nextUri the driver cannot reach, because it is refused for
+	// downgrading https to http, redirected, or failing on the network, is
+	// often why the query is being cancelled. The coordinator also cancels a
+	// query by its id.
+	if err != nil && !answeredByServer(err) {
+		err = qr.deleteQuery(qr.stmt.conn.baseURL + "/v1/query/" + url.PathEscape(qr.queryID))
+	}
+	return err
+}
+
+// deleteQuery sends a DELETE that cancels the query to target. The
+// coordinator answers it with 204, and with 404 when the query is already
+// gone.
+func (qr *driverRows) deleteQuery(target string) error {
+	hs := make(http.Header)
+	if qr.exec.user != "" {
+		hs.Add(trinoUserHeader, qr.exec.user)
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(qr.ctx), DefaultCancelQueryTimeout)
+	defer cancel()
+	req, err := qr.stmt.conn.newRequest(ctx, "DELETE", target, nil, hs)
+	if err != nil {
+		return err
+	}
+	resp, err := qr.stmt.conn.roundTrip(ctx, req)
+	if err != nil {
+		var qferr *ErrQueryFailed
+		if errors.As(err, &qferr) && (qferr.StatusCode == http.StatusNoContent || qferr.StatusCode == http.StatusNotFound) {
+			qr.nextURI = ""
+			return nil
+		}
+		return err
+	}
+	resp.Body.Close()
+	return qr.err
+}
+
+// answeredByServer reports whether err is the answer of the server a request
+// was sent to, rather than a failure to deliver it there.
+func answeredByServer(err error) bool {
+	var qferr *ErrQueryFailed
+	return errors.As(err, &qferr) && (qferr.StatusCode < 300 || qferr.StatusCode >= 400)
+}
+
+// drainSpooledRows discards the rows of a spooled result until it ends.
+func (qr *driverRows) drainSpooledRows() error {
+	for {
+		select {
+		case _, ok := <-qr.exec.spoolingRowsChannel:
+			if !ok {
+				return io.EOF
+			}
+		case err := <-qr.exec.errors:
+			if err == nil {
+				return io.EOF
+			}
+			qr.exec.cancelDecodersWorkers()
+			qr.exec.cancelDownloadWorkers()
+			return err
+		case <-qr.ctx.Done():
+			qr.exec.cancelDecodersWorkers()
+			qr.exec.cancelDownloadWorkers()
+			return qr.ctx.Err()
+		}
+	}
+}
+
+// Columns returns the names of the columns.
+func (qr *driverRows) Columns() []string {
+	if qr.err != nil {
+		return []string{}
+	}
+	if qr.columns == nil {
+		if err := qr.fetch(); err != nil && err != io.EOF {
+			qr.err = err
+			return []string{}
+		}
+	}
+	return qr.columns
+}
+
+func (qr *driverRows) ColumnTypeDatabaseTypeName(index int) string {
+	return qr.coltype[index].databaseTypeName
+}
+
+func (qr *driverRows) ColumnTypeScanType(index int) reflect.Type {
+	return qr.coltype[index].scanType
+}
+
+func (qr *driverRows) ColumnTypeLength(index int) (int64, bool) {
+	return qr.coltype[index].size.value, qr.coltype[index].size.hasValue
+}
+
+func (qr *driverRows) ColumnTypePrecisionScale(index int) (precision, scale int64, ok bool) {
+	return qr.coltype[index].precision.value, qr.coltype[index].scale.value, qr.coltype[index].precision.hasValue
+}
+
+// ColumnTypeNullable reports every column as nullable, because the protocol
+// never says whether a column can hold NULL.
+func (qr *driverRows) ColumnTypeNullable(index int) (nullable, ok bool) {
+	return true, true
+}
+
+// Next is called to populate the next row of data into
+// the provided slice. The provided slice will be the same
+// size as the Columns() are wide.
+//
+// Next should return io.EOF when there are no more rows.
+func (qr *driverRows) Next(dest []driver.Value) (err error) {
+	defer func() {
+		if err != nil && err != io.EOF && qr.authorization != nil {
+			qr.stmt.conn.restoreAuthorization(*qr.authorization)
+			qr.authorization = nil
+		}
+	}()
+	if qr.err != nil {
+		return qr.err
+	}
+	if !qr.exec.usingSpooledProtocol && (qr.columns == nil || qr.rowindex >= len(qr.data)) {
+		if qr.nextURI == "" {
+			qr.err = io.EOF
+			return qr.err
+		}
+		if err := qr.fetch(); err != nil {
+			qr.err = err
+			return err
+		}
+	} else if qr.exec.usingSpooledProtocol && (qr.rowindex >= len(qr.data) || qr.data == nil) {
+		var ok bool
+		select {
+		// The spoolingRowsChannel is initialized in startSpoolingProtocolWorkers,
+		// which is called by fetch() when the first query response indicates
+		// the spooling protocol (i.e., the response contains segments).
+		// At that point, usingSpooledProtocol is set to true and the channel is created.
+		case qr.data, ok = <-qr.exec.spoolingRowsChannel:
+			if !ok {
+				qr.err = io.EOF
+				return qr.err
+			}
+
+			qr.rowindex = 0
+
+		case <-qr.ctx.Done():
+			qr.exec.cancelDecodersWorkers()
+			qr.exec.cancelDownloadWorkers()
+			qr.err = qr.ctx.Err()
+			return qr.err
+		case err := <-qr.exec.errors:
+			if err == nil {
+				// Channel was closed, which means the statement
+				// or rows were closed.
+				qr.err = io.EOF
+				return qr.err
+			} else if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				// Close stops the workers and the rest of the query.
+				qr.Close()
+				qr.err = err
+				return qr.err
+			}
+			qr.exec.cancelDecodersWorkers()
+			qr.exec.cancelDownloadWorkers()
+			qr.err = err
+			return qr.err
+		}
+	}
+
+	return qr.next(dest)
+}
+
+func (qr *driverRows) next(dest []driver.Value) error {
+	if len(qr.coltype) == 0 {
+		qr.err = sql.ErrNoRows
+		return qr.err
+	}
+	copy(dest, qr.data[qr.rowindex])
+	qr.rowindex++
+	return nil
+}
+
+// LastInsertId returns the database's auto-generated ID
+// after, for example, an INSERT into a table with primary
+// key.
+func (qr driverRows) LastInsertId() (int64, error) {
+	return 0, ErrOperationNotSupported
+}
+
+// RowsAffected returns the number of rows affected by the query.
+func (qr driverRows) RowsAffected() (int64, error) {
+	return qr.rowsAffected, nil
+}
+
+// queryResponse is one page of a query's results. Its Data is decoded once
+// the columns are known: it is an array of rows for the direct protocol and
+// a spooledData object for the spooling protocol.
+type queryResponse struct {
+	ID          string         `json:"id"`
+	InfoURI     string         `json:"infoUri"`
+	NextURI     string         `json:"nextUri"`
+	Columns     []queryColumn  `json:"columns"`
+	Data        jsontext.Value `json:"data"`
+	Stats       stmtStats      `json:"stats"`
+	Error       ErrTrino       `json:"error"`
+	UpdateType  string         `json:"updateType"`
+	UpdateCount int64          `json:"updateCount"`
+	Warnings    []Warning      `json:"warnings"`
+}
+
+// Warning is a warning the coordinator attached to a query, such as a
+// deprecation notice or a performance hint.
+type Warning struct {
+	// Code and Name identify the warning; Name is the stable identifier
+	// (matching io.trino.spi.connector.StandardWarningCode on the
+	// coordinator), Code is not guaranteed to stay the same across releases.
+	Code    int
+	Name    string
+	Message string
+}
+
+// warningWire mirrors the coordinator's io.trino.client.Warning JSON shape,
+// which nests the code under "warningCode" instead of flattening it.
+type warningWire struct {
+	WarningCode struct {
+		Code int    `json:"code"`
+		Name string `json:"name"`
+	} `json:"warningCode"`
+	Message string `json:"message"`
+}
+
+func (w *Warning) UnmarshalJSON(data []byte) error {
+	var wire warningWire
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	w.Code = wire.WarningCode.Code
+	w.Name = wire.WarningCode.Name
+	w.Message = wire.Message
+	return nil
+}
+
+var _ json.Unmarshaler = (*Warning)(nil)
+
+// Warnings collects the warnings of one query. Pass a pointer as the
+// sql.Named("warnings", &warnings) argument of Query or Exec; after the rows
+// are consumed, All returns every distinct warning in the order the
+// coordinator first reported it.
+type Warnings struct {
+	mu   sync.Mutex
+	seen map[Warning]struct{}
+	list []Warning
+}
+
+// All returns a copy of every distinct warning collected so far, in the
+// order the coordinator first reported it.
+func (w *Warnings) All() []Warning {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]Warning(nil), w.list...)
+}
+
+// add records ws, skipping any warning already seen. Warning is deduplicated
+// as a whole rather than by Code alone, since Code is not guaranteed to stay
+// the same across releases.
+func (w *Warnings) add(ws []Warning) {
+	if len(ws) == 0 {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.seen == nil {
+		w.seen = make(map[Warning]struct{}, len(ws))
+	}
+	for _, warning := range ws {
+		if _, ok := w.seen[warning]; ok {
+			continue
+		}
+		w.seen[warning] = struct{}{}
+		w.list = append(w.list, warning)
+	}
+}
+
+// spooledData is the data of a page of the spooling protocol: the rows are
+// in segments, either inline in the page or in storage.
+type spooledData struct {
+	Encoding string        `json:"encoding"`
+	Segments []dataSegment `json:"segments"`
+}
+
+type dataSegment struct {
+	// Type is "inline" for a segment whose rows are in Data, or "spooled"
+	// for one to download from URI.
+	Type     string              `json:"type"`
+	Data     []byte              `json:"data"`
+	URI      string              `json:"uri"`
+	AckURI   string              `json:"ackUri"`
+	Headers  map[string][]string `json:"headers"`
+	Metadata *segmentAttributes  `json:"metadata"`
+}
+
+// segmentAttributes are the attributes the server describes a segment
+// with. The mandatory ones are pointers, so a missing one can be reported.
+type segmentAttributes struct {
+	RowOffset *int64 `json:"rowOffset"`
+	// Bug: rowsCount was wrongly not enforced as a mandatory field on Trino response. Fixed on 475 release
+	RowsCount        *int64 `json:"rowsCount"`
+	SegmentSize      *int64 `json:"segmentSize"`
+	UncompressedSize int64  `json:"uncompressedSize"`
+	ExpiresAt        string `json:"expiresAt"`
+}
+
+type segmentMetadata struct {
+	rowOffset        int64
+	rowsCount        optionalInt64
+	segmentSize      int64
+	uncompressedSize int64
+}
+
+type spooledMetadata struct {
+	segmentIndex int
+	uri          string
+	ackUri       string
+	encoding     string
+	headers      map[string][]string
+	metadata     segmentMetadata
+	expiresAt    time.Time
+}
+
+func (s dataSegment) segmentMetadata(segmentIndex int) (segmentMetadata, error) {
+	if s.Metadata == nil {
+		return segmentMetadata{}, fmt.Errorf("metadata is missing in segment at index %d", segmentIndex)
+	}
+	if s.Metadata.RowOffset == nil {
+		return segmentMetadata{}, fmt.Errorf("rowOffset is missing in segment metadata at index %d", segmentIndex)
+	}
+	if s.Metadata.SegmentSize == nil {
+		return segmentMetadata{}, fmt.Errorf("segmentSize is missing in segment metadata at index %d", segmentIndex)
+	}
+	metadata := segmentMetadata{
+		rowOffset:        *s.Metadata.RowOffset,
+		segmentSize:      *s.Metadata.SegmentSize,
+		uncompressedSize: s.Metadata.UncompressedSize,
+	}
+	if s.Metadata.RowsCount != nil {
+		metadata.rowsCount = newOptionalInt64(*s.Metadata.RowsCount)
+	}
+	if metadata.rowOffset < 0 || metadata.segmentSize < 0 || metadata.uncompressedSize < 0 || metadata.rowsCount.value < 0 {
+		return segmentMetadata{}, fmt.Errorf("negative value in segment metadata at index %d: rowOffset %d, segmentSize %d, uncompressedSize %d, rowsCount %d",
+			segmentIndex, metadata.rowOffset, metadata.segmentSize, metadata.uncompressedSize, metadata.rowsCount.value)
+	}
+	// Trino and its Java client declare both sizes as int, so a larger value
+	// never comes from a real server.
+	if metadata.segmentSize > math.MaxInt32 || metadata.uncompressedSize > math.MaxInt32 {
+		return segmentMetadata{}, fmt.Errorf("size above %d in segment metadata at index %d: segmentSize %d, uncompressedSize %d",
+			math.MaxInt32, segmentIndex, metadata.segmentSize, metadata.uncompressedSize)
+	}
+	return metadata, nil
+}
+
+func (s dataSegment) spooledMetadata(segmentIndex int, metadata segmentMetadata, encoding string, location *time.Location) (spooledMetadata, error) {
+	if s.URI == "" {
+		return spooledMetadata{}, fmt.Errorf("missing 'uri' field in spooled segment at index %d", segmentIndex)
+	}
+	if s.AckURI == "" {
+		return spooledMetadata{}, fmt.Errorf("missing 'ackUri' field in spooled segment at index %d", segmentIndex)
+	}
+	return spooledMetadata{
+		segmentIndex: segmentIndex,
+		uri:          s.URI,
+		ackUri:       s.AckURI,
+		encoding:     encoding,
+		headers:      s.Headers,
+		metadata:     metadata,
+		expiresAt:    parseSegmentExpiresAt(s.Metadata.ExpiresAt, location),
+	}, nil
+}
+
+// parseSegmentExpiresAt reads the time after which a spooled segment may be
+// gone from storage. The server formats it as a local date-time in the
+// session time zone. It only explains a failed download, so a missing or
+// malformed value is ignored and returns the zero time.
+func parseSegmentExpiresAt(value string, location *time.Location) time.Time {
+	if value == "" {
+		return time.Time{}
+	}
+	if expiresAt, err := time.Parse(time.RFC3339Nano, value); err == nil {
+		return expiresAt
+	}
+	// Java's LocalDateTime.toString omits the seconds when they and the
+	// fraction are zero; Go accepts a fraction after the seconds on its own.
+	for _, layout := range []string{"2006-01-02T15:04:05", "2006-01-02T15:04"} {
+		if expiresAt, err := time.ParseInLocation(layout, value, location); err == nil {
+			return expiresAt
+		}
+	}
+	return time.Time{}
+}
+
+func decodeSegment(data []byte, encoding string, metadata segmentMetadata, decoder *rowsDecoder) ([]queryData, error) {
+	if int64(len(data)) != metadata.segmentSize {
+		return nil, fmt.Errorf("segment size mismatch: expected %d bytes, got %d bytes", metadata.segmentSize, len(data))
+	}
+
+	decompressedSegment, err := decompressSegment(data, encoding, metadata)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := decoder.decodeRows(decompressedSegment, int(metadata.rowsCount.value))
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode segment at rowOffset %d: %v", metadata.rowOffset, err)
+	}
+	if metadata.rowsCount.hasValue && int64(len(rows)) != metadata.rowsCount.value {
+		return nil, fmt.Errorf("segment at rowOffset %d has %d rows but its metadata says %d", metadata.rowOffset, len(rows), metadata.rowsCount.value)
+	}
+	return rows, nil
+}
+
+// maxLZ4Ratio bounds how much an LZ4 block can expand: each compressed byte
+// yields at most 255 output bytes.
+const maxLZ4Ratio = 255
+
+// maxZstdRatio bounds how much zstd data can expand: a block yields at most
+// 128 KiB and takes at least 4 bytes, a 3-byte header and one RLE byte.
+const maxZstdRatio = 128 << 10 / 4
+
+func decompressSegment(data []byte, encoding string, metadata segmentMetadata) ([]byte, error) {
+	if metadata.uncompressedSize == 0 {
+		return data, nil
+	}
+
+	var decompressedData []byte
+	switch encoding {
+	case "json+zstd":
+		if metadata.uncompressedSize > maxZstdRatio*int64(len(data)) {
+			return nil, fmt.Errorf("uncompressed size %d is not possible for a %d-byte zstd segment at rowOffset %d", metadata.uncompressedSize, len(data), metadata.rowOffset)
+		}
+		// Without the cap limit, DecodeAll sizes its buffer from the frame
+		// header rather than from the declared uncompressed size.
+		zstdDecoder, err := zstd.NewReader(nil, zstd.WithDecodeAllCapLimit(true))
+		if err != nil {
+			return nil, fmt.Errorf("error creating zstd reader: %w", err)
+		}
+		defer zstdDecoder.Close()
+		dst := make([]byte, 0, metadata.uncompressedSize)
+		decompressedData, err = zstdDecoder.DecodeAll(data, dst)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decompress zstd segment at rowOffset %d: %v", metadata.rowOffset, err)
+		}
+	case "json+lz4":
+		if metadata.uncompressedSize > maxLZ4Ratio*int64(len(data)) {
+			return nil, fmt.Errorf("uncompressed size %d is not possible for a %d-byte LZ4 segment at rowOffset %d", metadata.uncompressedSize, len(data), metadata.rowOffset)
+		}
+		decompressedData = make([]byte, metadata.uncompressedSize)
+
+		n, err := lz4.UncompressBlock(data, decompressedData)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decompress LZ4 segment at rowOffset %d: %v", metadata.rowOffset, err)
+		}
+
+		decompressedData = decompressedData[:n]
+	default:
+		return nil, fmt.Errorf("unsupported segment encoder: %s", encoding)
+	}
+
+	if int64(len(decompressedData)) != metadata.uncompressedSize {
+		return nil, fmt.Errorf("decompressed size mismatch: expected %d bytes, got %d bytes", metadata.uncompressedSize, len(decompressedData))
+	}
+
+	return decompressedData, nil
+}
+
+type queryColumn struct {
+	Name          string        `json:"name"`
+	Type          string        `json:"type"`
+	TypeSignature typeSignature `json:"typeSignature"`
+}
+
+type queryData []driver.Value
+
+type namedTypeSignature struct {
+	FieldName     rowFieldName  `json:"fieldName"`
+	TypeSignature typeSignature `json:"typeSignature"`
+}
+
+type rowFieldName struct {
+	Name string `json:"name"`
+}
+
+type typeSignature struct {
+	RawType   string         `json:"rawType"`
+	Arguments []typeArgument `json:"arguments"`
+}
+
+type typeKind string
+
+const (
+	KIND_TYPE       = typeKind("TYPE")
+	KIND_NAMED_TYPE = typeKind("NAMED_TYPE")
+	KIND_LONG       = typeKind("LONG")
+	KIND_VARIABLE   = typeKind("VARIABLE")
+)
+
+type typeArgument struct {
+	// Kind determines if the typeSignature, namedTypeSignature, or long field has a value
+	Kind  typeKind       `json:"kind"`
+	Value jsontext.Value `json:"value"`
+	// typeSignature decoded from Value when Kind is TYPE
+	typeSignature typeSignature
+	// namedTypeSignature decoded from Value when Kind is NAMED_TYPE
+	namedTypeSignature namedTypeSignature
+	// long decoded from Value when Kind is LONG
+	long int64
+}
+
+func handleResponseError(status int, respErr ErrTrino) error {
+	switch respErr.ErrorName {
+	case "":
+		return nil
+	case "USER_CANCELLED":
+		return ErrQueryCancelled
+	default:
+		return &ErrQueryFailed{
+			StatusCode: status,
+			Reason:     &respErr,
+		}
+	}
+}
+
+func (qr *driverRows) startOrderedSegmentStreamer() {
+	go func() {
+		defer close(qr.exec.spoolingRowsChannel)
+		defer close(qr.exec.spoolingProcesserDone)
+
+		consumed := 0
+		buffer := make([]decodedSegment, 0, qr.exec.spoolingMaxOutOfOrderSegments)
+		var nextExpectedOffset int64 = 0
+
+		for {
+			select {
+			case segment, ok := <-qr.exec.decodedSegments:
+				if !ok {
+					if len(buffer) > 0 {
+						qr.sendStreamerError(fmt.Errorf("spooled segments missing: expected rowOffset %d, %d segments not delivered", nextExpectedOffset, len(buffer)))
+					}
+					return
+				}
+
+				// A segment without rows cannot overlap any other.
+				if len(segment.queryData) > 0 && segment.rowOffset < nextExpectedOffset {
+					qr.sendStreamerError(fmt.Errorf("spooled segment at rowOffset %d overlaps rows already delivered up to rowOffset %d", segment.rowOffset, nextExpectedOffset))
+					return
+				}
+				// A segment without rows has nothing to deliver or order,
+				// and Rows.Next reads the first row of every batch it
+				// receives; drop it and release its slot.
+				if len(segment.queryData) == 0 {
+					select {
+					case <-qr.exec.segmentThrottleCh:
+					case <-qr.exec.doneCh:
+						return
+					}
+					continue
+				}
+
+				buffer = append(buffer, segment)
+
+				if nextExpectedOffset != segment.rowOffset {
+					if len(buffer) >= qr.exec.spoolingMaxOutOfOrderSegments {
+						qr.sendStreamerError(fmt.Errorf(
+							"all %d out-of-order segments buffered (limit: %d). This indicates a bug or inconsistency in the segments metadata response (e.g., missing, duplicate, or misordered segments, or row offsets not matching the expected sequence)",
+							len(buffer), qr.exec.spoolingMaxOutOfOrderSegments))
+					}
+
+					continue
+				}
+
+				consumed = 0
+				slices.SortFunc(buffer, func(a, b decodedSegment) int {
+					if a.rowOffset < b.rowOffset {
+						return -1
+					}
+					if a.rowOffset > b.rowOffset {
+						return 1
+					}
+					return 0
+				})
+
+				for consumed < len(buffer) && buffer[consumed].rowOffset == nextExpectedOffset {
+					select {
+					case qr.exec.spoolingRowsChannel <- buffer[consumed].queryData:
+					case <-qr.exec.doneCh:
+						return
+					}
+
+					// release reserved slot
+					select {
+					case <-qr.exec.segmentThrottleCh:
+					case <-qr.exec.doneCh:
+						return
+					}
+
+					nextExpectedOffset += int64(len(buffer[consumed].queryData))
+					consumed++
+				}
+
+				copy(buffer[0:], buffer[consumed:])
+				buffer = buffer[:len(buffer)-consumed]
+
+			case <-qr.exec.doneCh:
+				return
+			}
+		}
+	}()
+}
+
+// sendStreamerError reports an error from the ordered streamer unless the
+// rows are being closed.
+func (qr *driverRows) sendStreamerError(err error) {
+	select {
+	case qr.exec.errors <- err:
+	case <-qr.exec.doneCh:
+	}
+}
+
+func (qr *driverRows) fetch() error {
+	var qresp queryResponse
+	var err error
+	for {
+		select {
+		case qresp = <-qr.exec.queryResponses:
+			if qresp.ID == "" {
+				return io.EOF
+			}
+			if qr.exec.warnings != nil {
+				qr.exec.warnings.add(qresp.Warnings)
+			}
+
+			err = qr.initColumns(&qresp)
+			if err != nil {
+				return err
+			}
+
+			qr.rowindex = 0
+			qr.nextURI = qresp.NextURI
+			switch qresp.Data.Kind() {
+			case '[':
+				// direct protocol
+				qr.data, err = qr.rowsDecoder().decodeRows(qresp.Data, 0)
+				if err != nil {
+					return fmt.Errorf("trino: %w", err)
+				}
+			case '{':
+				// spooling protocol
+				if qr.columns == nil {
+					// The workers decode with the columns known when they
+					// start, so the server must send the columns first.
+					return errors.New("trino: spooled data without columns")
+				}
+				spooled, err := decodeSpooledData(qresp.Data)
+				if err != nil {
+					return err
+				}
+				qr.exec.startSpoolingProtocolWorkers(qr.ctx, qr.rowsDecoder())
+				qr.exec.sendHeartbeatURI(qresp.NextURI)
+				qr.startOrderedSegmentStreamer()
+
+				// The segments are queued from the processor goroutine:
+				// the queue only drains as the caller reads rows, which it
+				// cannot do before this call returns.
+				qr.proccessSpollingSegments(spooled)
+
+				return nil
+			case 0, 'n':
+				qr.data = nil
+			default:
+				return fmt.Errorf("trino: unexpected data in query response, expected an array of rows or the spooled segments, got %s", qresp.Data)
+			}
+			qr.rowsAffected = qresp.UpdateCount
+			qr.scheduleProgressUpdate(qresp.ID, qresp.Stats)
+			if len(qr.data) != 0 {
+				return nil
+			}
+		case err = <-qr.exec.errors:
+			if err == nil {
+				// Channel was closed, which means the statement
+				// or rows were closed.
+				err = io.EOF
+			} else if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				qr.Close()
+			}
+			qr.err = err
+			return err
+		}
+	}
+}
+
+// location returns the zone the server produces values without a time zone
+// in for this statement.
+func (ex *execution) location() *time.Location {
+	if ex.timeZone != nil {
+		return ex.timeZone
+	}
+	return ex.conn.location()
+}
+
+// naiveLocation returns the zone values without a time zone are read in.
+func (ex *execution) naiveLocation() *time.Location {
+	if ex.conn.naiveTimeZone != nil {
+		return ex.conn.naiveTimeZone
+	}
+	return ex.location()
+}
+
+func (ex *execution) startSpoolingProtocolWorkers(ctx context.Context, decoder *rowsDecoder) {
+	ex.usingSpooledProtocol = true
+
+	if ex.spoolingWorkerCount == 0 {
+		ex.spoolingWorkerCount = defaultSpoolingDownloadWorkers
+	}
+
+	if ex.spoolingMaxOutOfOrderSegments == 0 {
+		ex.spoolingMaxOutOfOrderSegments = defaultallowedOutOfOrder
+	}
+
+	if ex.conn.heartbeatInterval != nil {
+		ex.heartbeatInterval = *ex.conn.heartbeatInterval
+	} else {
+		ex.heartbeatInterval = defaultHeartbeatInterval
+	}
+
+	downloadSegmentsCtx, cancelDownloadWorkers := context.WithCancel(ctx)
+	ex.cancelDownloadWorkers = cancelDownloadWorkers
+	decodeSegmentCtx, cancelDecodersWorkers := context.WithCancel(ctx)
+	ex.cancelDecodersWorkers = cancelDecodersWorkers
+
+	ex.segmentsToProccess = make(chan segmentToProccess, 1000)
+	ex.spooledSegmentsMetadata = make(chan spooledMetadata, ex.spoolingMaxOutOfOrderSegments)
+	ex.spooledSegmentsToDecode = make(chan segmentToDecode, ex.spoolingMaxOutOfOrderSegments)
+	ex.spoolingRowsChannel = make(chan []queryData)
+	ex.spoolingProcesserDone = make(chan struct{})
+	ex.segmentDispatcherDoneCh = make(chan struct{})
+	ex.segmentThrottleCh = make(chan struct{}, ex.spoolingMaxOutOfOrderSegments)
+	ex.decodedSegments = make(chan decodedSegment)
+
+	ex.heartbeatNextURICh = make(chan string, 1)
+	ex.spoolingProcessorExited = make(chan struct{})
+
+	ex.startSegmentDispatcher()
+	ex.startDownloadSegmentsWorkers(downloadSegmentsCtx)
+	ex.startSegmentsDecodersWorkers(decodeSegmentCtx, decoder)
+	ex.startHeartbeat(ctx)
+}
+
+func (ex *execution) sendHeartbeatURI(uri string) {
+	if uri == "" {
+		return
+	}
+	// Non-blocking: drain any old value, then send the new one.
+	select {
+	case <-ex.heartbeatNextURICh:
+	default:
+	}
+	select {
+	case ex.heartbeatNextURICh <- uri:
+	default:
+	}
+}
+
+func (ex *execution) startHeartbeat(ctx context.Context) {
+	ticker := time.NewTicker(ex.heartbeatInterval)
+	heartbeatCtx, cancelHeartbeat := context.WithCancel(ctx)
+	ex.cancelHeartbeat = cancelHeartbeat
+	ex.waitHeartbeat.Add(1)
+
+	go func() {
+		defer ex.waitHeartbeat.Done()
+		defer ticker.Stop()
+		var currentNextURI string
+		var consecutiveFailures int
+
+		for {
+			select {
+			case uri := <-ex.heartbeatNextURICh:
+				currentNextURI = uri
+
+			case <-ticker.C:
+				if currentNextURI == "" {
+					continue
+				}
+
+				reqCtx, cancel := context.WithTimeout(heartbeatCtx, heartbeatRequestTimeout)
+				hs := make(http.Header)
+				if ex.user != "" {
+					hs.Add(trinoUserHeader, ex.user)
+				}
+				req, err := ex.conn.newRequest(reqCtx, "HEAD", currentNextURI, nil, hs)
+				if err != nil {
+					cancel()
+					consecutiveFailures++
+					if consecutiveFailures >= maxHeartbeatFailures {
+						return
+					}
+					continue
+				}
+
+				resp, err := ex.conn.httpClient.Do(req)
+				cancel()
+				if err != nil {
+					consecutiveFailures++
+					if consecutiveFailures >= maxHeartbeatFailures {
+						return
+					}
+					continue
+				}
+				resp.Body.Close()
+
+				switch resp.StatusCode {
+				case http.StatusOK:
+					consecutiveFailures = 0
+				case http.StatusMethodNotAllowed, http.StatusNotImplemented:
+					// the coordinator doesn't support heartbeats; a 404 is not
+					// conclusive, since it's also returned by a coordinator
+					// that doesn't know the query, e.g. behind a load balancer
+					return
+				default:
+					consecutiveFailures++
+					if consecutiveFailures >= maxHeartbeatFailures {
+						return
+					}
+				}
+
+			case <-heartbeatCtx.Done():
+				return
+
+			case <-ex.doneCh:
+				return
+			}
+		}
+	}()
+}
+
+func (ex *execution) startSegmentDispatcher() {
+	go func() {
+		defer close(ex.segmentDispatcherDoneCh)
+		defer close(ex.segmentThrottleCh)
+		for {
+			select {
+			case segmentToProccess, ok := <-ex.segmentsToProccess:
+				if !ok {
+					return
+				}
+
+				// segmentThrottleCh blocks if there are too many out-of-order segments.
+				// Once all currently downloaded segments are downloaded, decoded,
+				// and can be ordered, this channel will be drained.
+				select {
+				case ex.segmentThrottleCh <- struct{}{}:
+				case <-ex.doneCh:
+					return
+				}
+
+				// The first error fails the query, so the dispatcher stops
+				// at it instead of reporting the consequences of a bad
+				// segment several more times.
+				segment := segmentToProccess.segment
+				segmentIndex := segmentToProccess.segmentIndex
+				metadata, err := segment.segmentMetadata(segmentIndex)
+				if err != nil {
+					ex.errors <- err
+					return
+				}
+				switch segment.Type {
+				case "inline":
+					if segment.Data == nil {
+						ex.errors <- fmt.Errorf("missing 'data' field in inline segment at index %d", segmentIndex)
+						return
+					}
+					ex.spooledSegmentsToDecode <- segmentToDecode{
+						segmentIndex: segmentIndex,
+						encoding:     segmentToProccess.encoding,
+						data:         segment.Data,
+						metadata:     metadata,
+					}
+
+				case "spooled":
+					spooledMetadata, err := segment.spooledMetadata(segmentIndex, metadata, segmentToProccess.encoding, ex.location())
+					if err != nil {
+						ex.errors <- err
+						return
+					}
+					ex.spooledSegmentsMetadata <- spooledMetadata
+
+				default:
+					ex.errors <- fmt.Errorf("unsupported type %q of segment at index %d", segment.Type, segmentIndex)
+					return
+				}
+
+			case <-ex.doneCh:
+				return
+			}
+		}
+	}()
+}
+
+func (ex *execution) startDownloadSegmentsWorkers(ctx context.Context) {
+	ex.waitDownloadSegmentsWorkers.Add(ex.spoolingWorkerCount)
+	for i := 0; i < ex.spoolingWorkerCount; i++ {
+		go func() {
+			defer ex.waitDownloadSegmentsWorkers.Done()
+			for {
+				select {
+				case metadata, ok := <-ex.spooledSegmentsMetadata:
+					if !ok {
+						return
+					}
+
+					segmentFetcher := &SegmentFetcher{
+						ctx:             ctx,
+						httpClient:      ex.conn.segmentHTTPClient,
+						spooledMetadata: metadata,
+						acks:            &ex.waitSegmentAcks,
+						failedAcks:      &ex.failedSegmentAcks,
+						retryLimit:      ex.conn.retryLimit,
+					}
+
+					segment, err := segmentFetcher.fetchSegment()
+					if err != nil {
+						ex.errors <- err
+						return
+					}
+
+					select {
+					case ex.spooledSegmentsToDecode <- segmentToDecode{
+						segmentIndex: metadata.segmentIndex,
+						encoding:     metadata.encoding,
+						data:         segment,
+						metadata:     metadata.metadata,
+					}:
+					case <-ex.doneCh:
+						return
+					case <-ctx.Done():
+						return
+					}
+
+				case <-ex.doneCh:
+					return
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+}
+
+func (ex *execution) startSegmentsDecodersWorkers(ctx context.Context, decoder *rowsDecoder) {
+	ex.waitSegmentDecodersWorkers.Add(ex.spoolingWorkerCount)
+	for i := 0; i < ex.spoolingWorkerCount; i++ {
+		go func() {
+			defer ex.waitSegmentDecodersWorkers.Done()
+			for {
+				select {
+				case segmentToDecode, ok := <-ex.spooledSegmentsToDecode:
+
+					if !ok {
+						return
+					}
+
+					segment, err := decodeSegment(segmentToDecode.data, segmentToDecode.encoding, segmentToDecode.metadata, decoder)
+					if err != nil {
+						ex.cancelDecodersWorkers()
+						ex.errors <- fmt.Errorf("failed to decode spooled segment at index %d: %v", segmentToDecode.segmentIndex, err)
+						return
+					}
+
+					select {
+					case ex.decodedSegments <- decodedSegment{
+						rowOffset: segmentToDecode.metadata.rowOffset,
+						queryData: segment,
+					}:
+					case <-ex.doneCh:
+						return
+					case <-ctx.Done():
+						return
+					}
+
+				case <-ex.doneCh:
+					return
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+}
+
+func (qr *driverRows) proccessSpollingSegments(first spooledData) {
+	queryResponses := qr.exec.queryResponses
+	exited := qr.exec.spoolingProcessorExited
+	go func() {
+		defer close(exited)
+		if !qr.queueSpoolingSegments(first) {
+			qr.waitForAllSpoolingWorkersFinish()
+			return
+		}
+		// A closed channel yields the zero queryResponse, whose empty ID is
+		// also the explicit end marker, so both end up draining the workers.
+		for qresp := range queryResponses {
+			if qresp.ID == "" {
+				break
+			}
+			if qr.exec.warnings != nil {
+				qr.exec.warnings.add(qresp.Warnings)
+			}
+
+			qr.exec.sendHeartbeatURI(qresp.NextURI)
+
+			switch qresp.Data.Kind() {
+			case '{':
+				spooled, err := decodeSpooledData(qresp.Data)
+				if err != nil {
+					qr.exec.errors <- err
+					break
+				}
+				if !qr.queueSpoolingSegments(spooled) {
+					qr.waitForAllSpoolingWorkersFinish()
+					return
+				}
+			case 0, 'n':
+				// do nothing: trino response without data (e.g only status information)
+			default:
+				qr.exec.errors <- fmt.Errorf("trino: unexpected data in query %s response, expected the spooled segments, got %s", qresp.ID, qresp.Data)
+			}
+			qr.scheduleProgressUpdate(qresp.ID, qresp.Stats)
+		}
+		qr.waitForAllSpoolingWorkersFinish()
+	}()
+}
+
+func (qr *driverRows) waitForAllSpoolingWorkersFinish() {
+	close(qr.exec.segmentsToProccess)
+	<-qr.exec.segmentDispatcherDoneCh
+	close(qr.exec.spooledSegmentsMetadata)
+	qr.exec.waitDownloadSegmentsWorkers.Wait()
+	close(qr.exec.spooledSegmentsToDecode)
+	qr.exec.waitSegmentDecodersWorkers.Wait()
+	close(qr.exec.decodedSegments)
+	<-qr.exec.spoolingProcesserDone
+}
+
+type segmentToProccess struct {
+	segmentIndex int
+	encoding     string
+	segment      dataSegment
+}
+
+func decodeSpooledData(data jsontext.Value) (spooledData, error) {
+	var spooled spooledData
+	if err := json.Unmarshal(data, &spooled); err != nil {
+		return spooledData{}, fmt.Errorf("trino: invalid spooled segments: %w", err)
+	}
+	if spooled.Encoding == "" {
+		return spooledData{}, fmt.Errorf("trino: missing 'encoding' field on spooling protocol")
+	}
+	return spooled, nil
+}
+
+// queueSpoolingSegments hands the segments of a page to the dispatcher. It
+// returns false when the rows are closed or the query's context ends first,
+// as the queue only drains while the caller reads rows.
+func (qr *driverRows) queueSpoolingSegments(spooled spooledData) bool {
+	for segmentIndex, segment := range spooled.Segments {
+		select {
+		case qr.exec.segmentsToProccess <- segmentToProccess{
+			segmentIndex: segmentIndex,
+			encoding:     spooled.Encoding,
+			segment:      segment,
+		}:
+		case <-qr.exec.doneCh:
+			return false
+		case <-qr.ctx.Done():
+			// The caller may still be reading the rows queued so far, which
+			// end like a complete result once the workers are shut down.
+			select {
+			case qr.exec.errors <- qr.ctx.Err():
+			case <-qr.exec.doneCh:
+			}
+			return false
+		}
+	}
+	return true
+}
+
+// maxTypeSignatureDepth limits how deeply the types of a column nest. Each
+// level decodes the JSON of all the levels below it again, so the cost grows
+// with the square of the depth.
+const maxTypeSignatureDepth = 100
+
+func unmarshalArguments(signature *typeSignature) error {
+	return unmarshalArgumentsAt(signature, 1)
+}
+
+func unmarshalArgumentsAt(signature *typeSignature, depth int) error {
+	if depth > maxTypeSignatureDepth {
+		return fmt.Errorf("type signature is nested deeper than %d levels", maxTypeSignatureDepth)
+	}
+	for i, argument := range signature.Arguments {
+		var payload interface{}
+		switch argument.Kind {
+		case KIND_TYPE:
+			payload = &(signature.Arguments[i].typeSignature)
+		case KIND_NAMED_TYPE:
+			payload = &(signature.Arguments[i].namedTypeSignature)
+		case KIND_LONG:
+			payload = &(signature.Arguments[i].long)
+		}
+		err := json.Unmarshal(argument.Value, payload)
+		if err != nil {
+			return err
+		}
+		switch argument.Kind {
+		case KIND_TYPE:
+			err = unmarshalArgumentsAt(&(signature.Arguments[i].typeSignature), depth+1)
+		case KIND_NAMED_TYPE:
+			err = unmarshalArgumentsAt(&(signature.Arguments[i].namedTypeSignature.TypeSignature), depth+1)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (qr *driverRows) initColumns(qresp *queryResponse) error {
+	if qr.columns != nil || len(qresp.Columns) == 0 {
+		return nil
+	}
+	for i := range qresp.Columns {
+		if err := unmarshalArguments(&(qresp.Columns[i].TypeSignature)); err != nil {
+			return fmt.Errorf("error decoding column type signature: %w", err)
+		}
+	}
+	coltype := make([]*columnType, len(qresp.Columns))
+	for i, col := range qresp.Columns {
+		var err error
+		if coltype[i], err = newColumnType(col.Type, col.TypeSignature); err != nil {
+			return err
+		}
+	}
+	decoder, err := newRowsDecoder(qresp.Columns, qr.exec.naiveLocation())
+	if err != nil {
+		return err
+	}
+	qr.columns = decoder.columns
+	qr.coltype = coltype
+	qr.decoder = decoder
+	return nil
+}
+
+// rowsDecoder returns the decoder of the columns, or one without columns,
+// which decodes only empty rows, before the server sent them.
+func (qr *driverRows) rowsDecoder() *rowsDecoder {
+	if qr.decoder == nil {
+		return &rowsDecoder{}
+	}
+	return qr.decoder
+}
+
+func (qr *driverRows) scheduleProgressUpdate(id string, stats stmtStats) {
+	if qr.exec.progressUpdater == nil {
+		return
+	}
+
+	qrStats := QueryProgressInfo{
+		QueryId:                      id,
+		QueryStats:                   stats,
+		FailedSegmentAcknowledgments: qr.exec.failedSegmentAcks.Load(),
+	}
+	qr.exec.lastProgress = qrStats
+	currentTime := time.Now()
+	diff := currentTime.Sub(qr.exec.progressUpdaterPeriod.LastCallbackTime)
+	period := qr.exec.progressUpdaterPeriod.Period
+
+	// Check if period has not passed yet AND if query state did not change
+	if diff < period && qr.exec.progressUpdaterPeriod.LastQueryState == qrStats.QueryStats.State {
+		return
+	}
+
+	// Wait for the updater to take the update rather than dropping it while
+	// the callback is still busy with the previous one, so a state change
+	// reported only once, like the query finishing, is never lost.
+	select {
+	case qr.exec.statsCh <- qrStats:
+	case <-qr.exec.doneCh:
+	}
+	qr.exec.progressUpdaterPeriod.LastCallbackTime = currentTime
+	qr.exec.progressUpdaterPeriod.LastQueryState = qrStats.QueryStats.State
+}
+
+// columnType describes a column the way the driver.RowsColumnType*
+// methods report it.
+type columnType struct {
+	databaseTypeName string
+	scanType         reflect.Type
+	precision        optionalInt64
+	scale            optionalInt64
+	size             optionalInt64
+}
+
+type optionalInt64 struct {
+	value    int64
+	hasValue bool
+}
+
+func newOptionalInt64(value int64) optionalInt64 {
+	return optionalInt64{value: value, hasValue: true}
+}
+
+func newColumnType(typeName string, signature typeSignature) (*columnType, error) {
+	result := &columnType{databaseTypeName: databaseTypeName(typeName, signature)}
+	var err error
+	result.scanType, err = getScanType(signature)
+	if err != nil {
+		return nil, err
+	}
+	switch signature.RawType {
+	case "char", "varchar":
+		if len(signature.Arguments) > 0 {
+			if signature.Arguments[0].Kind != KIND_LONG {
+				return nil, ErrInvalidResponseType
+			}
+			result.size = newOptionalInt64(signature.Arguments[0].long)
+		}
+	case "decimal":
+		if len(signature.Arguments) > 0 {
+			if signature.Arguments[0].Kind != KIND_LONG {
+				return nil, ErrInvalidResponseType
+			}
+			result.precision = newOptionalInt64(signature.Arguments[0].long)
+		}
+		if len(signature.Arguments) > 1 {
+			if signature.Arguments[1].Kind != KIND_LONG {
+				return nil, ErrInvalidResponseType
+			}
+			result.scale = newOptionalInt64(signature.Arguments[1].long)
+		}
+	case "time", "time with time zone", "timestamp", "timestamp with time zone":
+		if len(signature.Arguments) > 0 {
+			if signature.Arguments[0].Kind != KIND_LONG {
+				return nil, ErrInvalidResponseType
+			}
+			result.precision = newOptionalInt64(signature.Arguments[0].long)
+		}
+	case "interval year to month", "interval day to second":
+		if err := describeInterval(result, signature); err != nil {
+			return nil, err
+		}
+	}
+
+	return result, nil
+}
+
+// intervalFields names the interval fields by the codes Trino sends as the
+// first two arguments of an interval type.
+var intervalFields = []string{"YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND"}
+
+const (
+	intervalMonthField  = 1
+	intervalDayField    = 2
+	intervalSecondField = 5
+)
+
+// describeInterval names an interval by its qualifier, like INTERVAL DAY(3)
+// TO SECOND(9), and reports its leading-field precision as the precision and
+// its fractional-seconds precision as the scale, the way the JDBC driver does.
+// Without the PARAMETRIC_INTERVAL capability, or before Trino 484, the
+// server sends no arguments and the interval keeps its raw type name.
+func describeInterval(column *columnType, signature typeSignature) error {
+	if len(signature.Arguments) == 0 {
+		return nil
+	}
+	dayToSecond := signature.RawType == "interval day to second"
+	if len(signature.Arguments) != 3 && !(dayToSecond && len(signature.Arguments) == 4) {
+		return ErrInvalidResponseType
+	}
+	for _, argument := range signature.Arguments {
+		if argument.Kind != KIND_LONG {
+			return ErrInvalidResponseType
+		}
+	}
+	firstField, lastField := int64(0), int64(intervalMonthField)
+	if dayToSecond {
+		firstField, lastField = intervalDayField, intervalSecondField
+	}
+	start, end := signature.Arguments[0].long, signature.Arguments[1].long
+	if start < firstField || end > lastField || start > end {
+		return ErrInvalidResponseType
+	}
+
+	column.databaseTypeName = intervalTypeName(signature)
+	column.precision = newOptionalInt64(signature.Arguments[2].long)
+	if len(signature.Arguments) == 4 {
+		column.scale = newOptionalInt64(signature.Arguments[3].long)
+	}
+	return nil
+}
+
+// intervalTypeName renders the SQL qualifier the way the server names the
+// column type and the JDBC driver's getColumnTypeName does, like INTERVAL
+// SECOND(2, 0), INTERVAL DAY(3) TO SECOND(9) or INTERVAL YEAR(5) TO MONTH.
+func intervalTypeName(signature typeSignature) string {
+	start, end := signature.Arguments[0].long, signature.Arguments[1].long
+	leading := fmt.Sprintf("INTERVAL %s(%d)", intervalFields[start], signature.Arguments[2].long)
+	if end != intervalSecondField || len(signature.Arguments) != 4 {
+		if start == end {
+			return leading
+		}
+		return leading + " TO " + intervalFields[end]
+	}
+	fractional := signature.Arguments[3].long
+	if start == end {
+		return fmt.Sprintf("INTERVAL SECOND(%d, %d)", signature.Arguments[2].long, fractional)
+	}
+	return fmt.Sprintf("%s TO SECOND(%d)", leading, fractional)
+}
+
+// databaseTypeName names a container by its full type, since its raw type
+// alone does not say what it holds, and any other type by its raw type,
+// leaving its parameters to ColumnTypeLength and ColumnTypePrecisionScale.
+// ROW field names keep their case, since they are identifiers, not type
+// names; if typeName does not match the signature, all of it is upper-cased.
+func databaseTypeName(typeName string, signature typeSignature) string {
+	if !isContainer(signature.RawType) {
+		return strings.ToUpper(signature.RawType)
+	}
+	var name strings.Builder
+	if !appendTypeName(&name, typeName, signature) {
+		return strings.ToUpper(typeName)
+	}
+	return name.String()
+}
+
+func isContainer(rawType string) bool {
+	return rawType == "map" || rawType == "array" || rawType == "row"
+}
+
+// appendTypeName appends typeName, the text of a type with signature,
+// upper-cased except for the names of ROW fields, or returns false if
+// typeName does not have the arguments signature has.
+func appendTypeName(name *strings.Builder, typeName string, signature typeSignature) bool {
+	if !isContainer(signature.RawType) {
+		name.WriteString(strings.ToUpper(typeName))
+		return true
+	}
+	open := strings.IndexByte(typeName, '(')
+	if open < 0 || !strings.EqualFold(typeName[:open], signature.RawType) || !strings.HasSuffix(typeName, ")") {
+		return false
+	}
+	arguments := splitTypeArguments(typeName[open+1 : len(typeName)-1])
+	if len(arguments) != len(signature.Arguments) {
+		return false
+	}
+	name.WriteString(strings.ToUpper(typeName[:open+1]))
+	for i, argument := range arguments {
+		if i > 0 {
+			name.WriteByte(',')
+		}
+		argumentType := writeLeadingSpaces(name, argument)
+		argumentSignature, err := typeArgumentSignature(signature.Arguments[i])
+		if err != nil {
+			return false
+		}
+		if fieldName := signature.Arguments[i].namedTypeSignature.FieldName.Name; fieldName != "" {
+			writtenName, ok := cutFieldName(argumentType, fieldName)
+			if !ok {
+				return false
+			}
+			name.WriteString(writtenName)
+			argumentType = writeLeadingSpaces(name, argumentType[len(writtenName):])
+		}
+		if !appendTypeName(name, argumentType, argumentSignature) {
+			return false
+		}
+	}
+	name.WriteByte(')')
+	return true
+}
+
+// splitTypeArguments splits the arguments of a type on the commas outside
+// any nested type and quoted field name.
+func splitTypeArguments(arguments string) []string {
+	var result []string
+	depth, quoted, start := 0, false, 0
+	for i := 0; i < len(arguments); i++ {
+		switch {
+		case arguments[i] == '"':
+			quoted = !quoted
+		case quoted:
+		case arguments[i] == '(':
+			depth++
+		case arguments[i] == ')':
+			depth--
+		case arguments[i] == ',' && depth == 0:
+			result = append(result, arguments[start:i])
+			start = i + 1
+		}
+	}
+	return append(result, arguments[start:])
+}
+
+// writeLeadingSpaces writes the spaces text starts with, returning the rest.
+func writeLeadingSpaces(name *strings.Builder, text string) string {
+	rest := strings.TrimLeft(text, " ")
+	name.WriteString(text[:len(text)-len(rest)])
+	return rest
+}
+
+// cutFieldName returns fieldName the way field starts with it, quoted or
+// not, if a type follows it.
+func cutFieldName(field, fieldName string) (string, bool) {
+	for _, writtenName := range []string{fieldName, `"` + strings.ReplaceAll(fieldName, `"`, `""`) + `"`} {
+		if strings.HasPrefix(field, writtenName+" ") {
+			return writtenName, true
+		}
+	}
+	return "", false
+}
+
+// getScanType returns the type ColumnTypeScanType reports. An ARRAY or MAP
+// reports the generic scanner instantiated with the scan types of its
+// elements, or keys and values, recursively, so the scan type names the
+// scanner to use. When the column nests deeper than containerScanTypes
+// covers, the deepest instantiation it covers is reported, with
+// interface{} below that level.
+func getScanType(signature typeSignature) (reflect.Type, error) {
+	depth, err := containerDepth(signature)
+	if err != nil {
+		return nil, err
+	}
+	for levels := depth; levels > 0; levels-- {
+		if scanType, ok := containerScanType(signature, levels); ok {
+			return scanType, nil
+		}
+	}
+	return scalarScanType(signature.RawType), nil
+}
+
+// containerDepth returns how many levels of ARRAY and MAP a type nests,
+// rejecting signatures without the arguments an ARRAY or MAP needs.
+func containerDepth(signature typeSignature) (int, error) {
+	var arguments int
+	switch signature.RawType {
+	case "array":
+		arguments = 1
+	case "map":
+		arguments = 2
+	default:
+		return 0, nil
+	}
+	if len(signature.Arguments) != arguments {
+		return 0, ErrInvalidResponseType
+	}
+	depth := 0
+	for _, argument := range signature.Arguments {
+		argumentSignature, err := typeArgumentSignature(argument)
+		if err != nil {
+			return 0, err
+		}
+		argumentDepth, err := containerDepth(argumentSignature)
+		if err != nil {
+			return 0, err
+		}
+		depth = max(depth, argumentDepth)
+	}
+	return depth + 1, nil
+}
+
+// containerScanType returns the scan type of a type whose signature
+// containerDepth accepted, with interface{} for anything nested more than
+// levels deep, or false if containerScanTypes does not cover it.
+func containerScanType(signature typeSignature, levels int) (reflect.Type, bool) {
+	if signature.RawType != "array" && signature.RawType != "map" {
+		return scalarScanType(signature.RawType), true
+	}
+	if levels == 0 {
+		return anyScanType, true
+	}
+	argumentTypes := make([]reflect.Type, len(signature.Arguments))
+	for i, argument := range signature.Arguments {
+		argumentSignature, _ := typeArgumentSignature(argument)
+		argumentType, ok := containerScanType(argumentSignature, levels-1)
+		if !ok {
+			return nil, false
+		}
+		argumentTypes[i] = argumentType
+	}
+	if signature.RawType == "array" {
+		return containerScanTypes.slice(argumentTypes[0])
+	}
+	return containerScanTypes.mapOf(argumentTypes[0], argumentTypes[1])
+}
+
+func typeArgumentSignature(argument typeArgument) (typeSignature, error) {
+	switch argument.Kind {
+	case KIND_TYPE:
+		return argument.typeSignature, nil
+	case KIND_NAMED_TYPE:
+		return argument.namedTypeSignature.TypeSignature, nil
+	default:
+		return typeSignature{}, ErrInvalidResponseType
+	}
+}
+
+// scalarScanType returns the type a column of rawType, other than ARRAY and
+// MAP, scans into. A ROW reports Row, as NullRow needs a struct type that
+// only the caller knows.
+func scalarScanType(rawType string) reflect.Type {
+	var v interface{}
+	switch rawType {
+	case "boolean":
+		v = sql.NullBool{}
+	case "json", "char", "varchar", "interval year to month", "interval day to second", "decimal", "number", "ipaddress", "uuid", "Geometry", "SphericalGeography", "color", "unknown":
+		v = sql.NullString{}
+	case "variant":
+		v = Variant{}
+	case "varbinary":
+		v = []byte{}
+	case "tinyint", "smallint":
+		v = sql.NullInt32{}
+	case "integer":
+		v = sql.NullInt32{}
+	case "bigint":
+		v = sql.NullInt64{}
+	case "real", "double":
+		v = sql.NullFloat64{}
+	case "date", "time", "time with time zone", "timestamp", "timestamp with time zone":
+		v = sql.NullTime{}
+	case "row":
+		v = Row{}
+	case "KdbTree", "BingTile":
+		// passed through in the shape the JSON response used, so there is no dedicated scan type
+	default:
+		// every type without a textual form, like HyperLogLog or SetDigest, arrives as base64 like varbinary
+		v = []byte{}
+	}
+	if v == nil {
+		return reflect.TypeOf(new(interface{})).Elem()
+	}
+	return reflect.TypeOf(v)
+}
+
+// NullBinary represents a []byte that may be null.
+// This follows the same pattern as sql.NullString, sql.NullInt64, etc.
+type NullBinary struct {
+	Bytes []byte
+	Valid bool // Valid is true if Bytes is not NULL
+}
+
+// NullTime represents a time.Time value that can be null.
+// The NullTime supports Trino's Date, Time and Timestamp data types,
+// with or without time zone.
+type NullTime struct {
+	Time  time.Time
+	Valid bool
+}
+
+// Scan implements the sql.Scanner interface.
+func (s *NullTime) Scan(value interface{}) error {
+	if value == nil {
+		s.Time, s.Valid = time.Time{}, false
+		return nil
+	}
+	switch t := value.(type) {
+	case time.Time:
+		s.Time, s.Valid = t, true
+	case NullTime:
+		*s = t
+	}
+	return nil
+}
+
+// Row represents a ROW value. Its fields are read by position with Name and
+// Value, or by name with Field. An anonymous field is named field<i>, where
+// i is its zero-based position, as in the Java client. Valid is false for a
+// NULL row.
+type Row struct {
+	names  []string
+	values []interface{}
+	Valid  bool
+}
+
+// Len returns the number of fields in the row.
+func (r Row) Len() int {
+	return len(r.values)
+}
+
+// Name returns the name of the field at position i. It panics if i is out
+// of range.
+func (r Row) Name(i int) string {
+	return r.names[i]
+}
+
+// Value returns the value of the field at position i, converted the way a
+// plain column of the field's type would be. It panics if i is out of range.
+func (r Row) Value(i int) interface{} {
+	return r.values[i]
+}
+
+// Field returns the value of the first field called name, and whether the
+// row has such a field.
+func (r Row) Field(name string) (interface{}, bool) {
+	for i, n := range r.names {
+		if n == name {
+			return r.values[i], true
+		}
+	}
+	return nil, false
+}
+
+// Scan implements the sql.Scanner interface.
+func (r *Row) Scan(value interface{}) error {
+	if value == nil {
+		*r = Row{}
+		return nil
+	}
+	vv, ok := value.(Row)
+	if !ok {
+		return fmt.Errorf("trino: cannot convert %v (%T) to Row", value, value)
+	}
+	*r = vv
+	return nil
+}
+
+type QueryProgressInfo struct {
+	QueryId    string
+	QueryStats stmtStats
+	// FailedSegmentAcknowledgments counts spooled segments the driver read
+	// but could not acknowledge, which stay in storage until they expire.
+	FailedSegmentAcknowledgments int64
+}
+
+type queryProgressCallbackPeriod struct {
+	Period           time.Duration
+	LastCallbackTime time.Time
+	LastQueryState   string
+}
+
+type ProgressUpdater interface {
+	// Update the query progress, immediately when the query starts, when receiving data, and once when the query is finished.
+	// A spooled query whose segment acknowledgments failed gets one more update when its statement is closed.
+	// Updates are delivered in order from a separate goroutine, one at a time: a change of the query state
+	// is never dropped, so a callback slower than the result pages delays fetching the next one.
+	Update(QueryProgressInfo)
+}

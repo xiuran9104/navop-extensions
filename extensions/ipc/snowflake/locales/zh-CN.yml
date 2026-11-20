@@ -1,0 +1,14 @@
+name: Snowflake
+description: Snowflake 数据仓库 IPC 驱动，支持连接测试、SQL 查询、对象浏览及数据传输
+"common.create": "创建"
+"database.connection.tab.general": "常规"
+"database.snowflake.database.new": "新建数据库"
+"database.snowflake.database.name": "数据库名称"
+"database.snowflake.database.name.placeholder": "输入数据库名称"
+"database.snowflake.account": "Account"
+"database.snowflake.account.help": ""
+"database.snowflake.warehouse": "Warehouse"
+"database.snowflake.warehouse.help": ""
+"database.snowflake.role": "Role"
+"database.snowflake.role.help": ""
+"database.snowflake.database.help": "Snowflake 数据库名（Schema 默认 PUBLIC）"

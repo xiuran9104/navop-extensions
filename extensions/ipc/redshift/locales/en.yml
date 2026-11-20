@@ -1,0 +1,7 @@
+name: Amazon Redshift
+description: PostgreSQL-wire-compatible IPC driver for Amazon Redshift
+"common.create": "Create"
+"database.connection.tab.general": "General"
+"database.redshift.database.new": "New Database"
+"database.redshift.database.name": "Database Name"
+"database.redshift.database.name.placeholder": "Enter database name"

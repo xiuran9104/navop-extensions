@@ -1,0 +1,7 @@
+name: QuestDB
+description: PostgreSQL-wire-compatible IPC driver for QuestDB
+"common.create": "Create"
+"database.connection.tab.general": "General"
+"database.questdb.database.new": "New Database"
+"database.questdb.database.name": "Database Name"
+"database.questdb.database.name.placeholder": "Enter database name"

@@ -1,0 +1,7 @@
+name: Cloudberry
+description: PostgreSQL 协议兼容的 Cloudberry 数据库 IPC 驱动
+"common.create": "创建"
+"database.connection.tab.general": "常规"
+"database.cloudberry.database.new": "新建数据库"
+"database.cloudberry.database.name": "数据库名称"
+"database.cloudberry.database.name.placeholder": "输入数据库名称"

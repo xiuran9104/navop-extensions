@@ -1,0 +1,7 @@
+name: CockroachDB
+description: PostgreSQL 协议兼容的 CockroachDB 数据库 IPC 驱动
+"common.create": "创建"
+"database.connection.tab.general": "常规"
+"database.cockroachdb.database.new": "新建数据库"
+"database.cockroachdb.database.name": "数据库名称"
+"database.cockroachdb.database.name.placeholder": "输入数据库名称"

@@ -1,0 +1,14 @@
+name: Snowflake
+description: IPC driver for Snowflake
+"common.create": "Create"
+"database.connection.tab.general": "General"
+"database.snowflake.database.new": "New Database"
+"database.snowflake.database.name": "Database Name"
+"database.snowflake.database.name.placeholder": "Enter database name"
+"database.snowflake.account": "Account"
+"database.snowflake.account.help": ""
+"database.snowflake.warehouse": "Warehouse"
+"database.snowflake.warehouse.help": ""
+"database.snowflake.role": "Role"
+"database.snowflake.role.help": ""
+"database.snowflake.database.help": "Snowflake database name (schema defaults to PUBLIC)"

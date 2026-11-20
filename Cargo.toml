@@ -1,6 +1,9 @@
 [workspace]
 members = [
     "drivers/mongodb-driver",
+    "drivers/pgcompat-driver",
+    "drivers/mysqlcompat-driver",
+    "drivers/opengausscompat-driver",
     "extensions/composite/elasticsearch",
     "extensions/composite/docker",
     "extensions/composite/mqtt",
@@ -50,6 +53,11 @@ clickhouse = { version = "0.15.3", default-features = false, features = [
     "rustls-tls-native-roots",
 ] }
 duckdb = { version = "1.10504.0", features = ["bundled"] }
+mysql_async = { version = "0.36.1", features = ["rustls-tls"] }
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-chrono-0_4"] }
+tokio-postgres-rustls = "0.13"
+rustls-pemfile = "2"
+webpki-roots = "1"
 elasticsearch = { version = "9.1.0-alpha.1", default-features = false, features = ["rustls-tls"] }
 bollard = { version = "0.21.1", features = ["ssl"] }
 extension-driver = { git = "https://github.com/feigeCode/navop", rev = "4e18a15e6f98552736563fe91aa5e1ce1ad61dba" }

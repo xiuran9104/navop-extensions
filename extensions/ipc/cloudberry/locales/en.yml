@@ -1,0 +1,7 @@
+name: Cloudberry
+description: PostgreSQL-wire-compatible IPC driver for Cloudberry
+"common.create": "Create"
+"database.connection.tab.general": "General"
+"database.cloudberry.database.new": "New Database"
+"database.cloudberry.database.name": "Database Name"
+"database.cloudberry.database.name.placeholder": "Enter database name"

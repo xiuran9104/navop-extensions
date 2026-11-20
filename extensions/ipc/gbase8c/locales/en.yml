@@ -1,0 +1,7 @@
+name: GBase 8c
+description: PostgreSQL-wire-compatible IPC driver for GBase 8c
+"common.create": "Create"
+"database.connection.tab.general": "General"
+"database.gbase8c.database.new": "New Database"
+"database.gbase8c.database.name": "Database Name"
+"database.gbase8c.database.name.placeholder": "Enter database name"

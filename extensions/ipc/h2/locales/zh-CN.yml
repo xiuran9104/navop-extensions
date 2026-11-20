@@ -1,0 +1,7 @@
+name: H2（PG 服务模式）
+description: PostgreSQL 协议兼容的 H2（PG 服务模式） 数据库 IPC 驱动
+"common.create": "创建"
+"database.connection.tab.general": "常规"
+"database.h2.database.new": "新建数据库"
+"database.h2.database.name": "数据库名称"
+"database.h2.database.name.placeholder": "输入数据库名称"

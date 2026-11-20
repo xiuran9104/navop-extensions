@@ -1,0 +1,7 @@
+name: HighGo
+description: PostgreSQL-wire-compatible IPC driver for HighGo
+"common.create": "Create"
+"database.connection.tab.general": "General"
+"database.highgo.database.new": "New Database"
+"database.highgo.database.name": "Database Name"
+"database.highgo.database.name.placeholder": "Enter database name"

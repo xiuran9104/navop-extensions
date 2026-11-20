@@ -1,0 +1,7 @@
+name: QuestDB
+description: PostgreSQL 协议兼容的 QuestDB 数据库 IPC 驱动
+"common.create": "创建"
+"database.connection.tab.general": "常规"
+"database.questdb.database.new": "新建数据库"
+"database.questdb.database.name": "数据库名称"
+"database.questdb.database.name.placeholder": "输入数据库名称"

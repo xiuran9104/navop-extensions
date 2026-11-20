@@ -1,0 +1,67 @@
+[package]
+name = "pgcompat-driver"
+version = "0.1.0"
+edition.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "cockroachdb-driver"
+path = "src/bin/cockroachdb.rs"
+
+[[bin]]
+name = "cloudberry-driver"
+path = "src/bin/cloudberry.rs"
+
+[[bin]]
+name = "opentenbase-driver"
+path = "src/bin/opentenbase.rs"
+
+[[bin]]
+name = "highgo-driver"
+path = "src/bin/highgo.rs"
+
+[[bin]]
+name = "uxdb-driver"
+path = "src/bin/uxdb.rs"
+
+[[bin]]
+name = "gbase8c-driver"
+path = "src/bin/gbase8c.rs"
+
+[[bin]]
+name = "redshift-driver"
+path = "src/bin/redshift.rs"
+
+[[bin]]
+name = "questdb-driver"
+path = "src/bin/questdb.rs"
+
+[[bin]]
+name = "h2-driver"
+path = "src/bin/h2.rs"
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+chrono.workspace = true
+extension-driver.workspace = true
+extension-protocol.workspace = true
+interprocess.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+webpki-roots.workspace = true
+tokio-postgres.workspace = true
+tokio-postgres-rustls = "0.13"
+serde.workspace = true
+serde_json.workspace = true
+semver.workspace = true
+tokio = { workspace = true, features = ["io-util", "rt-multi-thread", "macros", "sync"] }
+
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+extension-host.workspace = true

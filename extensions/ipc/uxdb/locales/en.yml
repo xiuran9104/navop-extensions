@@ -1,0 +1,7 @@
+name: UXDB
+description: PostgreSQL-wire-compatible IPC driver for UXDB
+"common.create": "Create"
+"database.connection.tab.general": "General"
+"database.uxdb.database.new": "New Database"
+"database.uxdb.database.name": "Database Name"
+"database.uxdb.database.name.placeholder": "Enter database name"
